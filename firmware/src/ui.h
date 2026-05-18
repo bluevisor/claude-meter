@@ -10,9 +10,15 @@ enum screen_t {
     SCREEN_COUNT,
 };
 
-// Routed from main.cpp on a double-shake gesture: toggles
-// USAGE↔SPLASH, or on overview advances the focused session.
-void ui_handle_shake(void);
+// Roll (left/right tilt) toggles USAGE↔SPLASH inside a single
+// Claude Code session.
+void ui_handle_tilt_left(void);
+void ui_handle_tilt_right(void);
+
+// Pitch (forward/back tilt) cycles between active Claude Code
+// sessions. No-op when only one session is active.
+void ui_handle_tilt_forward(void);
+void ui_handle_tilt_back(void);
 
 // Called from main.cpp the moment a payload is received from the
 // daemon. Drives the stale-data watchdog.

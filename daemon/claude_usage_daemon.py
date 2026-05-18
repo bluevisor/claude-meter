@@ -66,8 +66,11 @@ ACTIVE_SYNC_INTERVAL = 15
 
 # Claude Code transcript discovery.
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-# A JSONL counts as "active" if its mtime is within this many seconds.
-SESSION_FRESH_SECONDS = 30 * 60
+# A JSONL counts as "active" (cycle-able from the device) if its mtime
+# is within this many seconds. Bumped from 30min → 4h so sessions that
+# the user has open in a terminal but hasn't typed in for a while still
+# show up in the focus rotation; they only fall off after a long idle.
+SESSION_FRESH_SECONDS = 4 * 60 * 60
 # Models with a [1m] suffix expose a 1M-token context window; everything
 # else is the regular 200k window.
 DEFAULT_CONTEXT_MAX = 200_000
@@ -270,31 +273,36 @@ async def poll_subscription(token: str) -> dict | None:
     return payload
 
 
-# Rolling token history so we can compute burn rate. (last_value, last_ts).
-_api_history: list[tuple[int, float]] = []
+# Rolling spend history so we can project burn rate. (spend_dollars, ts).
+_api_history: list[tuple[float, float]] = []
 
 
-def _burn_rate(tokens_now: int, now_ts: float) -> tuple[int, int]:
-    """Return (tokens_per_minute_instant, percent_change_vs_average)."""
-    _api_history.append((tokens_now, now_ts))
-    # Keep ~30 minutes of history (one poll/min → 30 entries)
+def _burn_rate(spend_now: float, now_ts: float) -> tuple[int, int]:
+    """Return (dollars_per_day × 100 cents-instant, percent_change_vs_average).
+
+    Tracks the last ~30 min of cumulative spend, projects the recent
+    delta out to a 24 h rate. Reported in *cents/day* so the firmware
+    can keep using its int field without losing precision.
+    """
+    _api_history.append((spend_now, now_ts))
     cutoff = now_ts - 30 * 60
     while len(_api_history) > 1 and _api_history[0][1] < cutoff:
         _api_history.pop(0)
     if len(_api_history) < 2:
         return 0, 0
-    # Instantaneous: last minute or so
-    prev_tok, prev_ts = _api_history[-2]
+    SEC_PER_DAY = 86400.0
+    # Instantaneous burn — last poll interval projected to a day.
+    prev_spend, prev_ts = _api_history[-2]
     dt = max(now_ts - prev_ts, 1.0)
-    instant_per_min = int(round((tokens_now - prev_tok) * 60.0 / dt))
-    # Average across the window
-    first_tok, first_ts = _api_history[0]
+    instant_dpd_cents = int(round((spend_now - prev_spend) * SEC_PER_DAY * 100.0 / dt))
+    # Average across the window.
+    first_spend, first_ts = _api_history[0]
     win = max(now_ts - first_ts, 60.0)
-    avg_per_min = int(round((tokens_now - first_tok) * 60.0 / win))
+    avg_dpd_cents = int(round((spend_now - first_spend) * SEC_PER_DAY * 100.0 / win))
     pct = 0
-    if avg_per_min > 0:
-        pct = int(round((instant_per_min - avg_per_min) * 100.0 / avg_per_min))
-    return max(instant_per_min, 0), pct
+    if avg_dpd_cents > 0:
+        pct = int(round((instant_dpd_cents - avg_dpd_cents) * 100.0 / avg_dpd_cents))
+    return max(instant_dpd_cents, 0), pct
 
 
 def _next_month_mins(now: datetime) -> int:
@@ -327,22 +335,48 @@ async def poll_api_billing(cfg: dict) -> dict | None:
     if not isinstance(record, dict):
         record = info if isinstance(info, dict) else {}
 
-    # Token counters — fall back to dollars/token conversion if LiteLLM
-    # only exposes spend.
+    # LiteLLM's user-level spend is a lifetime total (carries over from
+    # deleted keys), and `max_budget` is often null at the user level.
+    # When per-key budgets are set, those are the *current-period*
+    # numbers and what the device should display. Fall back to the
+    # user-level fields only when no key has a configured budget.
+    keys = info.get("keys", []) if isinstance(info, dict) else []
+    def _fnum(d: dict, k: str) -> float:
+        v = d.get(k) if isinstance(d, dict) else None
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    key_budget_sum = sum(_fnum(k, "max_budget") for k in keys)
+    if key_budget_sum > 0:
+        spend_dollars  = sum(_fnum(k, "spend")      for k in keys)
+        budget_dollars = key_budget_sum
+    else:
+        spend_dollars  = _fnum(record, "spend")
+        budget_dollars = _fnum(record, "max_budget")
+
     dpt = float(cfg.get("dollars_per_token", 1e-6))
     tokens_used  = int(record.get("total_tokens", record.get("tokens_used", 0)) or 0)
     tokens_quota = int(record.get("token_budget", record.get("max_tokens",  0)) or 0)
-    spend_dollars  = float(record.get("spend", 0.0) or 0.0)
-    budget_dollars = float(record.get("max_budget", 0.0) or 0.0)
     if not tokens_used and spend_dollars and dpt > 0:
         tokens_used = int(spend_dollars / dpt)
     if not tokens_quota and budget_dollars and dpt > 0:
         tokens_quota = int(budget_dollars / dpt)
 
-    burn_per_min, burn_pct = _burn_rate(tokens_used, time.time())
+    # bm is now dollars/day in cents (renamed semantics, same field on
+    # the wire). Firmware label should read "$X.XX/day", not "X k/min".
+    burn_per_min, burn_pct = _burn_rate(spend_dollars, time.time())
 
     now = datetime.now()
-    period_label = cfg.get("period_label") or now.strftime("%b %Y")
+    # If LiteLLM exposes a budget_duration like "30d" or "7d" on the
+    # key, use that as the period label so the device shows e.g.
+    # "$37 / $200 (30d)" instead of the calendar-month default.
+    duration = ""
+    for k in keys:
+        if isinstance(k, dict) and k.get("budget_duration"):
+            duration = str(k["budget_duration"])
+            break
+    period_label = cfg.get("period_label") or duration or now.strftime("%b %Y")
     api_reset_mins = _next_month_mins(now)
 
     payload: dict = {
@@ -481,6 +515,18 @@ def _fresh_state() -> dict:
         "prev_block_type": None,
         "last_block_type": None,
         "last_block_ts":   None,
+        # Last assistant message's stop_reason — "end_turn" / "tool_use" /
+        # "max_tokens" / None. Used to flip "active" to false the moment
+        # Claude declares end_turn, without waiting for SESSION_ACTIVE_SECONDS.
+        "last_stop_reason": None,
+        "last_stop_ts":     None,
+        # `baseUrl` captured from any user/assistant record. Non-empty
+        # means Claude Code is talking to a proxy (LiteLLM etc) → API
+        # mode. Null/empty → talking to api.anthropic.com → subscription.
+        "base_url":         None,
+        # cwd of the most-recent JSONL record. Lets the daemon match
+        # this session to a running `claude` process for env lookup.
+        "cwd":              None,
     }
 
 
@@ -492,6 +538,22 @@ def _fold_line(state: dict, line: str) -> None:
         obj = json.loads(line)
     except json.JSONDecodeError:
         return
+    # Latch baseUrl the first time we see a non-empty one. Claude Code
+    # captures whichever endpoint the session was launched against, and
+    # it doesn't change mid-session. (Currently 2.1.x leaves this null,
+    # so we also capture the session's cwd as a fallback key — the
+    # daemon then reads ANTHROPIC_BASE_URL from the running process'
+    # env via `ps -E`.)
+    if state.get("base_url") in (None, ""):
+        bu = obj.get("baseUrl")
+        if isinstance(bu, str) and bu.strip():
+            state["base_url"] = bu.strip()
+    # Track the *latest* cwd, not the first. If the user `cd`'d inside
+    # the session, the latest record is what matches the running
+    # claude process's current cwd.
+    c = obj.get("cwd")
+    if isinstance(c, str) and c:
+        state["cwd"] = c
     t = obj.get("type")
     ts = _parse_iso_timestamp(obj.get("timestamp", ""))
     if t == "user":
@@ -532,6 +594,10 @@ def _fold_line(state: dict, line: str) -> None:
         state["prev_block_type"] = state["last_block_type"]
         state["last_block_type"] = block_type
         state["last_block_ts"]   = ts
+    stop_reason = msg.get("stop_reason")
+    if stop_reason is not None:
+        state["last_stop_reason"] = stop_reason
+        state["last_stop_ts"]     = ts
 
 
 def read_session_usage(jsonl: Path) -> dict | None:
@@ -595,6 +661,8 @@ def read_session_usage(jsonl: Path) -> dict | None:
     prev_block_type    = state["prev_block_type"]
     last_block_type    = state["last_block_type"]
     last_block_ts      = state["last_block_ts"]
+    last_stop_reason   = state.get("last_stop_reason")
+    last_stop_ts       = state.get("last_stop_ts")
 
     ctx_used = (
         int(last_usage.get("input_tokens", 0) or 0)
@@ -649,11 +717,18 @@ def read_session_usage(jsonl: Path) -> dict | None:
         "task_tokens":  task_output_tokens,
         "task_seconds": task_seconds,
         "phase":        phase,
+        "last_stop_reason": last_stop_reason,
+        "last_stop_ts":     last_stop_ts,
+        "base_url":         state.get("base_url"),
+        "cwd":              state.get("cwd"),
     }
 
 
 # If the JSONL hasn't been touched in this long, Claude Code is idle.
-SESSION_ACTIVE_SECONDS = 60
+# 10s is short enough that the on-device "Zzz" idle animation shows up
+# within a couple seconds of a turn finishing, while still riding through
+# the usual sub-second pauses between tool calls inside a single turn.
+SESSION_ACTIVE_SECONDS = 10
 
 
 def _model_display_label(transcript_model: str, settings_model: str, ctx_max: int) -> str:
@@ -681,17 +756,46 @@ def _model_display_label(transcript_model: str, settings_model: str, ctx_max: in
     return name.strip() or "Claude"
 
 
-# Index of the currently-selected session within find_active_sessions().
-# Mutated by the BLE refresh char (shake-to-switch from the device).
-_selected_session_idx = 0
+# Identity of the currently-focused session, held as a Path so it
+# survives find_active_sessions() re-sorting (results are ordered by
+# mtime newest-first, which means a stale idx silently lands on a
+# different session as soon as anyone else types).
+_focused_session_path: Path | None = None
+
+
+def _resolve_focus_index(sessions: list[Path]) -> int:
+    """Return the index of the focused session in `sessions`.
+
+    Recovers gracefully if the focused session has disappeared (e.g.
+    aged out of SESSION_FRESH_SECONDS, JSONL got deleted) by snapping
+    to idx 0.
+    """
+    global _focused_session_path
+    if not sessions:
+        _focused_session_path = None
+        return 0
+    if _focused_session_path is None:
+        _focused_session_path = sessions[0]
+        return 0
+    try:
+        return sessions.index(_focused_session_path)
+    except ValueError:
+        _focused_session_path = sessions[0]
+        return 0
 
 
 def cycle_selected_session(direction: int = 1) -> int:
-    """Advance the focus session by +/-1 and return the new index."""
-    global _selected_session_idx
-    n = max(1, len(find_active_sessions()))
-    _selected_session_idx = (_selected_session_idx + direction) % n
-    return _selected_session_idx
+    """Advance the focus by +/-1 over the *path-identified* sessions."""
+    global _focused_session_path
+    sessions = find_active_sessions()
+    if not sessions:
+        return 0
+    cur = _resolve_focus_index(sessions)
+    new_idx = (cur + direction) % len(sessions)
+    _focused_session_path = sessions[new_idx]
+    log(f"Session cycle dir={direction:+d} → idx={new_idx} "
+        f"of {len(sessions)}: {_focused_session_path.name}")
+    return new_idx
 
 
 async def read_session_payload() -> dict | None:
@@ -699,10 +803,8 @@ async def read_session_payload() -> dict | None:
     sessions = find_active_sessions()
     if not sessions:
         return None
-    global _selected_session_idx
-    if _selected_session_idx >= len(sessions):
-        _selected_session_idx = 0
-    focus = sessions[_selected_session_idx]
+    focus_idx = _resolve_focus_index(sessions)
+    focus = sessions[focus_idx]
     summary = read_session_usage(focus)
     if summary is None:
         return None
@@ -710,7 +812,17 @@ async def read_session_payload() -> dict | None:
         mtime = focus.stat().st_mtime
     except OSError:
         mtime = 0.0
-    is_active = (time.time() - mtime) < SESSION_ACTIVE_SECONDS
+    # Primary signal: stop_reason="end_turn" on the last assistant
+    # message means Claude declared the turn over — flip to idle even
+    # if the mtime is still fresh, so the ESP32 swaps screens within a
+    # poll tick of the response landing instead of waiting for the
+    # SESSION_ACTIVE_SECONDS mtime timeout. Fall back to mtime-based
+    # staleness when stop_reason isn't available (older transcripts,
+    # tool_use waiting on results, etc).
+    now_ts = time.time()
+    is_active = (now_ts - mtime) < SESSION_ACTIVE_SECONDS
+    if is_active and summary.get("last_stop_reason") == "end_turn":
+        is_active = False
     settings_model = _settings_model() or ""
     label = _model_display_label(summary.get("model", ""), settings_model, summary["ctx_max"])
 
@@ -728,14 +840,34 @@ async def read_session_payload() -> dict | None:
         s_pct = 0
         if s_sum["ctx_max"]:
             s_pct = int(min(100.0, s_sum["ctx_used"] * 100.0 / s_sum["ctx_max"]) + 0.5)
+        s_active = (now_ts - s_mtime) < SESSION_ACTIVE_SECONDS
+        if s_active and s_sum.get("last_stop_reason") == "end_turn":
+            s_active = False
         overview.append({
             "ml":  s_label,
             "cp":  s_pct,
-            "ac":  1 if (time.time() - s_mtime) < SESSION_ACTIVE_SECONDS else 0,
+            "ac":  1 if s_active else 0,
             "tt":  s_sum["task_tokens"],
         })
 
+    # Determine API vs subscription, in priority order:
+    #   1. JSONL `baseUrl` field (currently null in Claude Code 2.1.x,
+    #      will become the source of truth once it's populated).
+    #   2. ANTHROPIC_BASE_URL of the running claude process whose cwd
+    #      matches this session.
+    # If both signals are unavailable, leave base_url as None and let
+    # _session_mode_for_base_url default to subscription — better to
+    # show stale-looking subscription numbers than to guess a mode
+    # from the model name (which is a misleading signal: Opus can
+    # run on LiteLLM, Sonnet/Haiku can run on Max).
+    base_url = summary.get("base_url")
+    if not base_url:
+        base_url = _base_url_for_cwd(summary.get("cwd"))
+
     return {
+        # Stash base_url at the top level so poll_usage() can read it
+        # without re-parsing the JSONL. Stripped before going over BLE.
+        "_base_url": base_url,
         "cu": summary["ctx_used"],
         "cm": summary["ctx_max"],
         # `act=1` tells the firmware Claude Code is mid-turn → flip to the
@@ -749,49 +881,140 @@ async def read_session_payload() -> dict | None:
         "ml":  label,
         # Current phase — drives which working animation to play.
         "ph":  summary["phase"],
-        # Multi-session: total count + the currently focused index.
+        # Multi-session: total count + the currently focused index
+        # (computed via path lookup so it survives mtime re-sorting).
         "sn":  len(sessions),
-        "si":  _selected_session_idx,
+        "si":  focus_idx,
         # Overview rows (kept short so the whole payload fits in one
         # BLE write; the firmware uses this for the overview screen).
         "sl":  overview,
     }
 
 
+def _session_mode_for_base_url(base_url: str | None) -> str:
+    """Empty/None baseUrl → talking to api.anthropic.com → subscription.
+    Anything else (LiteLLM, Bedrock proxy, …) → API."""
+    if not base_url:
+        return "subscription"
+    if "anthropic.com" in base_url.lower():
+        return "subscription"
+    return "api"
+
+
+# ---- Per-session ANTHROPIC_BASE_URL discovery via /bin/ps -E ----
+# Claude Code 2.1.x doesn't (yet) record the baseUrl field on JSONL
+# records, so we read it straight out of each running `claude` process's
+# environment. macOS `ps -E` exposes the env for our own user's procs;
+# we map each PID's PWD to the running session's cwd and use that as
+# the key.
+_proc_env_cache: dict[str, tuple[str, float]] = {}     # cwd -> (base_url, ts)
+_PROC_ENV_TTL = 3.0                                    # seconds
+
+
+def _refresh_proc_env_cache() -> None:
+    """Walk every running `claude` process, read its env (ps -E) and
+    real-time cwd (lsof), and update the cwd → base_url cache.
+
+    `PWD` in the env can be stale if the user cd'd inside the session;
+    lsof's `cwd` is the kernel's view of the current directory and is
+    always fresh.
+    """
+    import subprocess
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-x", "claude"],
+            capture_output=True, text=True, timeout=2.0,
+        ).stdout.split()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return
+    now = time.time()
+    _proc_env_cache.clear()
+    for pid in pids:
+        try:
+            env_line = subprocess.run(
+                ["ps", "-E", "-p", pid, "-ww", "-o", "command="],
+                capture_output=True, text=True, timeout=1.0,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        base_url = ""
+        for tok in env_line.split():
+            if tok.startswith("ANTHROPIC_BASE_URL="):
+                base_url = tok[len("ANTHROPIC_BASE_URL="):]
+                break
+        try:
+            # -a ANDs -p and -d; without it lsof OR's them and returns
+            # every fd from every process. -F outputs machine-parsable
+            # lines: `p<pid>`, `n<name>`, etc.
+            lsof_out = subprocess.run(
+                ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=1.0,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        cwd = ""
+        for line in lsof_out.splitlines():
+            if line.startswith("n"):
+                cwd = line[1:].strip()
+                break
+        if cwd:
+            _proc_env_cache[cwd] = (base_url, now)
+
+
+def _base_url_for_cwd(cwd: str | None) -> str | None:
+    """Return the ANTHROPIC_BASE_URL of the running claude process whose
+    PWD matches `cwd`, refreshing the cache if it's stale."""
+    if not cwd:
+        return None
+    now = time.time()
+    cached = _proc_env_cache.get(cwd)
+    if cached is None or (now - cached[1]) > _PROC_ENV_TTL:
+        _refresh_proc_env_cache()
+        cached = _proc_env_cache.get(cwd)
+    return cached[0] if cached else None
+
+
 async def poll_usage() -> dict | None:
     """Merge live session data with quota/billing data.
 
-    Layering:
-      * 5h / 7d / token / spend numbers come from LiteLLM (api mode)
-        or the Anthropic OAuth rate-limit headers (subscription mode).
-      * Context bar + activity flag come from the local JSONL.
-
-    The session layer is best-effort — if there's no fresh transcript,
-    we still emit the quota numbers.
+    The focused session's `baseUrl` decides which billing panel we push
+    — subscription (5h / 7d windows) when the session is talking to
+    api.anthropic.com directly, API (tokens / $ / burn) via LiteLLM
+    when a proxy is in front of it.
     """
+    session = await read_session_payload()
+    focused_base_url = (session or {}).pop("_base_url", None) if session else None
+    focus_mode = _session_mode_for_base_url(focused_base_url)
+    log(f"Focus: ml={(session or {}).get('ml','?')} "
+        f"base_url={focused_base_url!r} → {focus_mode}")
+
     base: dict | None = None
-    cfg = load_litellm_config()
-    if cfg is not None:
-        base = await poll_api_billing(cfg)
+    if focus_mode == "api":
+        cfg = load_litellm_config()
+        if cfg is not None:
+            base = await poll_api_billing(cfg)
+        if base is None:
+            # API session focused but no LiteLLM config (or poll
+            # failed) → emit a stub so the device can still render the
+            # API screen with "--" placeholders instead of locking us
+            # back into the subscription panel.
+            base = {"mode": "api", "tu": 0, "tq": 0, "ds": 0, "db": 0,
+                    "bm": 0, "bc": 0, "ar": -1, "pl": "",
+                    "st": "no_litellm", "ok": False}
     else:
         token = read_token()
         if not token:
-            # No credentials at all — surface this on the device.
             base = {"mode": "subscription", "s": 0, "sr": -1, "w": 0, "wr": -1,
                     "st": "no_token", "ok": False}
         else:
             base = await poll_subscription(token)
 
-    session = await read_session_payload()
-
     if base is None and session is None:
         log("No quota source and no active session; skipping poll")
         return None
     if base is None:
-        # No API/OAuth: emit a session-only payload so the meter still
-        # shows the live context bar + working-mode flag.
         return {
-            "mode": "subscription",
+            "mode": focus_mode,
             "s":  0.0, "sr": -1,
             "w":  0.0, "wr": -1,
             "st": "session",
@@ -896,6 +1119,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                     should_push = True
                 if (now - cur_mtime) < SESSION_ACTIVE_SECONDS:
                     session_is_active = True
+                    # Tail-parse so we can see the latest stop_reason
+                    # without re-doing the cold-parse work that
+                    # read_session_payload would do moments later.
+                    summary = read_session_usage(active)
+                    if summary and summary.get("last_stop_reason") == "end_turn":
+                        session_is_active = False
             # Active → idle (or idle → active) transition: push right
             # away so the firmware flips screens within a couple seconds
             # of the task finishing, not at the next 60s heartbeat.

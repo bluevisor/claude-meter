@@ -14,31 +14,39 @@
 //   's' bulb shine highlight (white), '.' transparent (bg).
 //
 // Frames:
-//   0 idle / feet A      1 idle / feet B (walk cycle)
+//   0 idle / feet A — left hand poked out at r6c0
+//   1 idle / feet B — right hand poked out at r6c15 (walk cycle swings arms)
 //   2 blink              3 squint / lower-lid
 //   4 look left          5 look right
 //   6 wide / surprised   7 sleepy / heavy-lid
 //   8 lightbulb (no shine) — pops in to replace the body during the
 //                            lightbulb beat
 //   9 lightbulb (with shine highlight) — alternates with #8 to twinkle
+// (The boot loading animation is the Seen Health spinning logo from
+// seen_logo_frames.h, not a Clawd dance — no extra Clawd frames needed.)
 static const char* const FRAMES[10][10] = {
-    // 0: idle, feet A (all four feet planted)
+    // 0: idle, feet A — left hand stub at col 0 (r6) so the walk cycle
+    // reads as an arm swing rather than just feet shuffling. Arm is on
+    // the lower-body row because r4-r5 are already full-width and have
+    // no transparent cells to extend into; r3 is the eye row so an
+    // extension there would visually merge with the eye.
     {
         "..############..", "..############..",
         "..##xx####xx##..", "..##xx####xx##..",
         "################", "################",
-        "..############..", "..############..",
+        "#.############..", "..############..",
         "...#.#....#.#...", "...#.#....#.#...",
     },
-    // 1: idle, feet B (outer feet up — subtle walk step)
+    // 1: idle, feet B — right hand stub at col 15 (r6); outer feet up.
     {
         "..############..", "..############..",
         "..##xx####xx##..", "..##xx####xx##..",
         "################", "################",
-        "..############..", "..############..",
+        "..############.#", "..############..",
         ".....#....#.....", ".....#....#.....",
     },
-    // 2: blink (eyes fully closed)
+    // 2: blink (eyes fully closed). Feet match frame 0 so the blink
+    // reads as just an eye change, not a sudden foot shuffle.
     {
         "..############..", "..############..",
         "..############..", "..############..",
@@ -46,7 +54,9 @@ static const char* const FRAMES[10][10] = {
         "..############..", "..############..",
         "...#.#....#.#...", "...#.#....#.#...",
     },
-    // 3: squint (only the lower lid open)
+    // 3: squint (only the lower lid open). Body band stays at r4-r5
+    // to match every other frame — moving it to r5-r6 made the head
+    // look detached on this frame only.
     {
         "..############..", "..############..",
         "..############..", "..##xx####xx##..",

@@ -213,7 +213,10 @@ void setup(void) {
 
     ui_init();
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
-    ui_show_screen(SCREEN_USAGE);
+    // Boot into the splash so Clawd dances while we wait for the first
+    // BLE payload. ui_update() flips to USAGE (or stays on SPLASH if the
+    // first payload reports an active turn) once data arrives.
+    ui_show_screen(SCREEN_SPLASH);
 
     Serial.println("Dashboard ready, waiting for data on BLE...");
 }
@@ -225,7 +228,10 @@ void loop(void) {
     ui_tick_anim();
     ble_tick();
     imu_tick();
-    if (imu_consume_double_shake()) ui_handle_shake();
+    if (imu_consume_tilt_left())     ui_handle_tilt_left();
+    if (imu_consume_tilt_right())    ui_handle_tilt_right();
+    if (imu_consume_tilt_forward())  ui_handle_tilt_forward();
+    if (imu_consume_tilt_back())     ui_handle_tilt_back();
 
     ble_state_t bs = ble_get_state();
     if (bs != last_ble_state) {

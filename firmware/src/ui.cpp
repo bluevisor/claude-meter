@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "clawd_sprite.h"
+#include "seen_logo.h"
 #include "theme.h"
 #include "display_cfg.h"
 #include <lvgl.h>
@@ -53,15 +54,36 @@ static lv_obj_t  *anim_gen_label, *anim_gen_pct, *anim_gen_bar_bg, *anim_gen_bar
 static lv_obj_t  *anim_ctx_label, *anim_ctx_value, *anim_ctx_bar_bg, *anim_ctx_bar_fill;
 static lv_obj_t  *anim_bulb        = nullptr;   // small yellow circle for the lightbulb beat
 static lv_obj_t  *anim_thought_dot = nullptr;   // little muted dot for the thinking beat
+static lv_obj_t  *anim_zzz_label   = nullptr;   // "Zzz" near the head during PHASE_IDLE
 
 // Daemon-status indicator. Lives on the active screen, just below the
 // title; shown only when ok=false (e.g. "api_fail", "no_token").
 static lv_obj_t  *status_label    = nullptr;
 
-// Set by ui_handle_shake when the user manually picks a screen, so the
-// auto-switch in ui_update doesn't immediately undo it. Cleared on the
-// next idle→active transition (a fresh turn always re-enters working).
+// "i/N" session-position pip shown top-left on every screen when more
+// than one Claude Code session is active. Lets the user see at a glance
+// whether a tilt-fwd/back actually advanced the focus.
+static lv_obj_t  *session_pip     = nullptr;
+
+// Set by ui_handle_single_shake when the user manually picks a screen,
+// so the auto-switch in ui_update doesn't immediately undo it. Cleared
+// on the next idle→active transition (a fresh turn always re-enters
+// working).
 static bool manual_screen_override = false;
+
+// Cached so ui_handle_double_shake() can suppress the gesture when
+// there's only one session to cycle through. Updated in ui_update().
+static uint8_t cached_session_count = 1;
+
+// Full-screen black rectangle used to cross-fade between the boot
+// dance and whatever screen the first payload puts us on. The backlight
+// isn't software-controllable on this board, so the "fade to black" is
+// achieved by animating an overlay's bg_opa. (bf_pending_phase lives
+// further down once work_phase_t is defined.)
+static lv_obj_t* fade_overlay = nullptr;
+enum boot_fade_state_t { BFS_IDLE, BFS_FADING_OUT, BFS_FADING_IN };
+static boot_fade_state_t bf_state = BFS_IDLE;
+#define BOOT_FADE_HALF_MS 600   // 1.2 s total (fade-to-black + reveal)
 
 // 6-circle spinner laid out as a 2-col × 3-row dot grid (matches the
 // braille "dots" cli-spinner pattern). Each frame is a 6-bit mask;
@@ -90,8 +112,13 @@ static lv_obj_t  *ov_row_dot[OVERVIEW_MAX_ROWS] = {};
 static screen_t  current_screen = SCREEN_USAGE;
 static UsageMode displayed_mode = MODE_UNKNOWN;
 
-enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB };
-static work_phase_t cur_phase = PHASE_WORKING;
+enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB, PHASE_DANCE, PHASE_IDLE };
+static work_phase_t bf_pending_phase = PHASE_WORKING;   // see fade_overlay block above
+// Cold boot starts in PHASE_DANCE — Clawd dances on the splash screen
+// until the daemon delivers its first payload. ui_update() flips us
+// into a data-driven phase as soon as anything lands (PHASE_IDLE when
+// no task is active, PHASE_WORKING/THINKING/LIGHTBULB otherwise).
+static work_phase_t cur_phase = PHASE_DANCE;
 
 // Stale-data watchdog. Updated whenever a payload arrives; if no
 // payload has shown up in >30s we surface a small red dot in the
@@ -375,7 +402,7 @@ static void init_api_screen(lv_obj_t* parent) {
     api_spend_of = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "of $0");
     lv_obj_align_to(api_spend_of, api_spend_value, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
 
-    api_burn_label = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Burn/min");
+    api_burn_label = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Burn/day");
     lv_obj_align(api_burn_label, LV_ALIGN_TOP_RIGHT, -MARGIN, 168);
 
     api_burn_value = make_label(api_container, &lv_font_montserrat_28, THEME_ACCENT, "--");
@@ -400,9 +427,11 @@ static void init_animation_screen(lv_obj_t* parent) {
 
     // Clawd, centered horizontally — room left at the top so the head
     // doesn't clip against the bezel; later ticks bob/sway around this.
+    // First frame is the Seen logo because cur_phase boots in
+    // PHASE_DANCE; ui_update() swaps to Clawd once data arrives.
     anim_clawd_img = lv_image_create(anim_container);
-    lv_image_set_src(anim_clawd_img, clawd_sprite_large(0));
-    lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID, 0, 20);
+    lv_image_set_src(anim_clawd_img, seen_logo_frame(0));
+    lv_obj_align(anim_clawd_img, LV_ALIGN_CENTER, 0, 0);
 
     // (The lightbulb beat now replaces the entire figure with a yellow
     // bulb sprite — no separate overlay widget needed.)
@@ -419,27 +448,39 @@ static void init_animation_screen(lv_obj_t* parent) {
     lv_obj_align(anim_thought_dot, LV_ALIGN_TOP_MID, 28, 14);
     lv_obj_add_flag(anim_thought_dot, LV_OBJ_FLAG_HIDDEN);
 
+    // "Zzz" label — sits over the figure's right shoulder; the tick
+    // loop cycles its text Z → Zz → Zzz during PHASE_IDLE. Sprite is
+    // ~96 px wide each side of center, so x=+60 lands it just past
+    // the right edge of the head.
+    anim_zzz_label = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT_MUTED, "Z");
+    lv_obj_align(anim_zzz_label, LV_ALIGN_TOP_MID, 60, 28);
+    lv_obj_add_flag(anim_zzz_label, LV_OBJ_FLAG_HIDDEN);
+
     // No "GENERATING" label — just the tokens + elapsed time, centered
     // and large so it reads at a glance from across the desk.
     anim_gen_label = make_label(anim_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "");
     lv_obj_add_flag(anim_gen_label, LV_OBJ_FLAG_HIDDEN);
 
-    anim_gen_pct = make_label(anim_container, &lv_font_montserrat_36, THEME_ACCENT, "--");
-    lv_obj_align(anim_gen_pct, LV_ALIGN_TOP_MID, 0, 156);
+    // Timer dropped from M36 to M28 — M36's 49 px line height pushed
+    // the whole bottom row past the prism's visible window, which is
+    // why the CONTEXT bar disappeared from view.
+    anim_gen_pct = make_label(anim_container, &lv_font_montserrat_28, THEME_ACCENT, "--");
+    lv_obj_align(anim_gen_pct, LV_ALIGN_TOP_MID, 0, 146);
 
     // Braille-style spinner: 6 small filled circles arranged in a 2x3
-    // grid. Hidden by default; shown in place of the token count while
-    // a turn is mid-flight before any output tokens arrive.
-    const int dot_d = 7;     // circle diameter
-    const int gap_x = 9;     // column spacing
-    const int gap_y = 8;     // row spacing
+    // grid. Sized to fit within a single digit slot of the M28 timer
+    // so it doesn't bleed into the CONTEXT row below. Dots bumped to
+    // 5 px — 4 px was hard to see through the prism magnification.
+    const int dot_d = 5;     // circle diameter
+    const int gap_x = 5;     // column spacing
+    const int gap_y = 2;     // row spacing
     const int cont_w = dot_d + gap_x;
-    const int cont_h = dot_d * 3 + gap_y * 2;
+    const int cont_h = dot_d * 3 + gap_y * 2;   // 19 px
     spin_container = make_pane(anim_container, 0, 0, cont_w, cont_h);
-    // Left of center — overlaps the token slot of the centered label
-    // so the spinner reads as "in place of the token count", with the
-    // timer remaining to its right.
-    lv_obj_align(spin_container, LV_ALIGN_TOP_MID, -52, 168);
+    // Left of center — sits in the empty token slot of the centered
+    // label; vertically centered on the M28 cap-height (~20 px from
+    // the label top at y=146).
+    lv_obj_align(spin_container, LV_ALIGN_TOP_MID, -40, 151);
     lv_obj_add_flag(spin_container, LV_OBJ_FLAG_HIDDEN);
     for (int i = 0; i < 6; i++) {
         spin_dots[i] = lv_obj_create(spin_container);
@@ -459,20 +500,97 @@ static void init_animation_screen(lv_obj_t* parent) {
     lv_obj_add_flag(anim_gen_bar_bg,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(anim_gen_bar_fill, LV_OBJ_FLAG_HIDDEN);
 
-    // CONTEXT bar — bumped to 18pt for legibility from across the desk.
-    anim_ctx_label = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT_MUTED, "CONTEXT");
-    lv_obj_set_pos(anim_ctx_label, MARGIN, 202);
+    // CONTEXT row — pulled up so the bar stays inside the prism's
+    // visible window (bar bottom was at LVGL y=232 → panel y=7 after
+    // the Y-flip, which the prism crops). Now bottom sits at LVGL
+    // y=218 → panel y=21, well inside the safe zone.
+    anim_ctx_label = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT_MUTED, "");
+    lv_obj_set_pos(anim_ctx_label, MARGIN, 188);
 
     anim_ctx_value = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT, "--");
-    lv_obj_align(anim_ctx_value, LV_ALIGN_TOP_RIGHT, -MARGIN, 202);
+    lv_obj_align(anim_ctx_value, LV_ALIGN_TOP_RIGHT, -MARGIN, 188);
 
-    anim_ctx_bar_bg = make_pane(anim_container, MARGIN, 224, SCR_W - 2 * MARGIN, 8);
+    anim_ctx_bar_bg = make_pane(anim_container, MARGIN, 210, SCR_W - 2 * MARGIN, 8);
     lv_obj_set_style_bg_color(anim_ctx_bar_bg, THEME_BAR_BG, 0);
     lv_obj_set_style_bg_opa(anim_ctx_bar_bg, LV_OPA_COVER, 0);
 
-    anim_ctx_bar_fill = make_pane(anim_container, MARGIN, 224, 0, 8);
+    anim_ctx_bar_fill = make_pane(anim_container, MARGIN, 210, 0, 8);
     lv_obj_set_style_bg_color(anim_ctx_bar_fill, THEME_GREEN, 0);
     lv_obj_set_style_bg_opa(anim_ctx_bar_fill, LV_OPA_COVER, 0);
+}
+
+// ---- Boot-to-data cross-fade ----
+static void apply_boot_dance_layout(bool booting);  // defined just below
+
+static void fade_set_opa(void* obj, int32_t v) {
+    lv_obj_set_style_bg_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
+}
+
+static void fade_in_done_cb(lv_anim_t* a) {
+    (void)a;
+    if (fade_overlay) lv_obj_add_flag(fade_overlay, LV_OBJ_FLAG_HIDDEN);
+    bf_state = BFS_IDLE;
+}
+
+static void fade_out_done_cb(lv_anim_t* a) {
+    (void)a;
+    // We're under a fully-opaque overlay; swap the visual state now so
+    // the user only sees the destination once we fade back in.
+    cur_phase    = bf_pending_phase;
+    walk_last_ms = 0;
+    anim_seq_idx = 0;
+    apply_boot_dance_layout(false);
+
+    // Reverse fade — reveal the new screen.
+    bf_state = BFS_FADING_IN;
+    lv_anim_t b;
+    lv_anim_init(&b);
+    lv_anim_set_var(&b, fade_overlay);
+    lv_anim_set_values(&b, 255, 0);
+    lv_anim_set_duration(&b, BOOT_FADE_HALF_MS);
+    lv_anim_set_exec_cb(&b, fade_set_opa);
+    lv_anim_set_completed_cb(&b, fade_in_done_cb);
+    lv_anim_start(&b);
+}
+
+static void start_boot_fade(work_phase_t target_phase) {
+    if (!fade_overlay || bf_state != BFS_IDLE) return;
+    bf_pending_phase = target_phase;
+    bf_state         = BFS_FADING_OUT;
+
+    lv_obj_set_style_bg_opa(fade_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(fade_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(fade_overlay);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, fade_overlay);
+    lv_anim_set_values(&a, 0, 255);
+    lv_anim_set_duration(&a, BOOT_FADE_HALF_MS);
+    lv_anim_set_exec_cb(&a, fade_set_opa);
+    lv_anim_set_completed_cb(&a, fade_out_done_cb);
+    lv_anim_start(&a);
+}
+
+// Hide / show everything on the splash screen except Clawd, used so the
+// cold-boot dance reads as just the figure in the middle of the panel.
+// The figure is re-centered to LV_ALIGN_CENTER while booting and
+// returned to its usual TOP_MID anchor once we leave PHASE_DANCE.
+static void apply_boot_dance_layout(bool booting) {
+    lv_obj_t* hideable[] = {
+        anim_gen_pct, spin_container,
+        anim_ctx_label, anim_ctx_value,
+        anim_ctx_bar_bg, anim_ctx_bar_fill,
+    };
+    for (lv_obj_t* o : hideable) {
+        if (!o) continue;
+        if (booting) lv_obj_add_flag(o,   LV_OBJ_FLAG_HIDDEN);
+        else         lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (anim_clawd_img) {
+        if (booting) lv_obj_align(anim_clawd_img, LV_ALIGN_CENTER,  0, 0);
+        else         lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID, 0, 20);
+    }
 }
 
 // ────────────────────── Overview screen ──────────────────────
@@ -550,6 +668,7 @@ static void render_overview(const UsageData* data) {
 
 void ui_init(void) {
     clawd_sprite_init();
+    seen_logo_init();
 
     lv_obj_t* scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, THEME_BG, 0);
@@ -570,6 +689,12 @@ void ui_init(void) {
     lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
 
+    // Session-position pip ("1/3") pinned top-left, shown only when
+    // sn>1. Lives on the screen root so it overlays every screen.
+    session_pip = make_label(scr, &lv_font_montserrat_14, THEME_ACCENT, "");
+    lv_obj_align(session_pip, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_add_flag(session_pip, LV_OBJ_FLAG_HIDDEN);
+
     // Stale-data indicator — small red dot pinned top-right; lives on
     // the active screen object so it overlays whatever else is shown.
     stale_dot = lv_obj_create(scr);
@@ -580,6 +705,24 @@ void ui_init(void) {
     lv_obj_set_style_bg_opa(stale_dot, LV_OPA_COVER, 0);
     lv_obj_align(stale_dot, LV_ALIGN_TOP_RIGHT, -4, 4);
     lv_obj_add_flag(stale_dot, LV_OBJ_FLAG_HIDDEN);
+
+    // Cold-boot starts in PHASE_DANCE — strip every non-figure widget
+    // off the splash so only the spinning logo is on screen.
+    // ui_update() restores them via a black-overlay cross-fade as soon
+    // as the first payload arrives.
+    apply_boot_dance_layout(true);
+
+    // Boot fade overlay — a full-screen black rectangle that lives on
+    // top of everything. Hidden in steady state; animated in/out for
+    // the boot→data transition.
+    fade_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(fade_overlay);
+    lv_obj_set_size(fade_overlay, SCR_W, SCR_H);
+    lv_obj_set_pos(fade_overlay, 0, 0);
+    lv_obj_set_style_bg_color(fade_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(fade_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(fade_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(fade_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void apply_mode_visibility(void) {
@@ -615,6 +758,25 @@ static lv_color_t context_color_for(int pct) {
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
 
+    cached_session_count = data->session_count;
+
+    // Session pip: "1/3" style indicator, visible only when there's
+    // more than one active session. Lets tilt-fwd/back feedback show
+    // even on screens that don't otherwise display the model name.
+    if (session_pip) {
+        if (data->session_count > 1) {
+            char pip_buf[8];
+            snprintf(pip_buf, sizeof(pip_buf), "%u/%u",
+                     (unsigned)(data->session_index + 1),
+                     (unsigned)data->session_count);
+            lv_label_set_text(session_pip, pip_buf);
+            lv_obj_clear_flag(session_pip, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(session_pip);
+        } else {
+            lv_obj_add_flag(session_pip, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     bool mode_changed = (displayed_mode != data->mode);
     displayed_mode = data->mode;
     if (mode_changed) apply_mode_visibility();
@@ -624,6 +786,7 @@ void ui_update(const UsageData* data) {
     const char* title_text = data->model_label[0] ? data->model_label : "Usage";
     lv_label_set_text(sub_title, title_text);
     lv_label_set_text(api_title, title_text);
+    lv_label_set_text(anim_ctx_label, title_text);
     lv_label_set_text(sub_tag, "MAX");
     lv_label_set_text(api_tag, "API");
     lv_obj_clear_flag(sub_tag, LV_OBJ_FLAG_HIDDEN);
@@ -698,8 +861,12 @@ void ui_update(const UsageData* data) {
         else            snprintf(money, sizeof(money), "no cap");
         lv_label_set_text(api_spend_of, money);
 
-        // Burn / min
-        format_token_count((uint64_t)data->burn_per_min, buf, sizeof(buf));
+        // Burn / day: daemon now reports dollars/day in cents (was
+        // tokens/min). Format as "$12.34" — fall back to "$X" when
+        // we're over $10 so the number stays compact at M28.
+        int cents = data->burn_per_min;
+        if (cents >= 1000) snprintf(buf, sizeof(buf), "$%d",      cents / 100);
+        else               snprintf(buf, sizeof(buf), "$%d.%02d", cents / 100, cents % 100);
         lv_label_set_text(api_burn_value, buf);
         if (data->burn_pct_change >= 0) snprintf(buf, sizeof(buf), "↑ %d%% avg", data->burn_pct_change);
         else                            snprintf(buf, sizeof(buf), "↓ %d%% avg", -data->burn_pct_change);
@@ -748,18 +915,37 @@ void ui_update(const UsageData* data) {
     render_working_line();
 
     // Phase swap drives which animation sequence runs and which overlay
-    // (lightbulb glow / thought dot) is shown.
+    // (lightbulb glow / thought dot / Zzz) is shown. When no task is
+    // active we drop into PHASE_IDLE so Clawd visibly naps instead of
+    // pretending to still be working.
     work_phase_t new_phase = PHASE_WORKING;
-    if (strcmp(data->phase, "thinking")  == 0) new_phase = PHASE_THINKING;
-    if (strcmp(data->phase, "lightbulb") == 0) new_phase = PHASE_LIGHTBULB;
+    if (!data->session_active)                 new_phase = PHASE_IDLE;
+    else if (strcmp(data->phase, "thinking")  == 0) new_phase = PHASE_THINKING;
+    else if (strcmp(data->phase, "lightbulb") == 0) new_phase = PHASE_LIGHTBULB;
     if (new_phase != cur_phase) {
-        cur_phase = new_phase;
-        walk_last_ms = 0;     // re-arm so the new sequence starts immediately
-        anim_seq_idx = 0;     // start at sequence frame 0 for the new phase
+        if (cur_phase == PHASE_DANCE) {
+            // Boot → data view. Don't change cur_phase yet — the
+            // fade-out callback applies the swap once the overlay is
+            // fully opaque, so the logo keeps spinning behind the fade.
+            start_boot_fade(new_phase);
+        } else {
+            cur_phase    = new_phase;
+            walk_last_ms = 0;
+            anim_seq_idx = 0;
+        }
+    } else if (bf_state == BFS_FADING_OUT) {
+        // While fading out the swap target may change (e.g. data went
+        // active→idle between the fade trigger and now). Keep the
+        // pending phase up to date so we land on the right thing.
+        bf_pending_phase = new_phase;
     }
     if (anim_bulb) {
         if (cur_phase == PHASE_LIGHTBULB) lv_obj_clear_flag(anim_bulb, LV_OBJ_FLAG_HIDDEN);
         else                              lv_obj_add_flag(anim_bulb,   LV_OBJ_FLAG_HIDDEN);
+    }
+    if (anim_zzz_label) {
+        if (cur_phase == PHASE_IDLE) lv_obj_clear_flag(anim_zzz_label, LV_OBJ_FLAG_HIDDEN);
+        else                         lv_obj_add_flag(anim_zzz_label,   LV_OBJ_FLAG_HIDDEN);
     }
     if (anim_thought_dot) {
         if (cur_phase == PHASE_THINKING) lv_obj_clear_flag(anim_thought_dot, LV_OBJ_FLAG_HIDDEN);
@@ -813,6 +999,16 @@ static const uint8_t ANIM_THINKING[] = {
 static const uint8_t ANIM_LIGHTBULB[] = {
     8, 9, 8, 8, 8, 8, 8, 8,
 };
+// PHASE_DANCE doesn't index Clawd frames — the tick loop substitutes
+// the Seen Health spinning logo. This stub just satisfies the
+// phase-table struct (length/interval are read; .seq[] is not).
+static const uint8_t ANIM_DANCE[] = { 0 };
+// "Idle" cycle — runs when the daemon reports no active task. Sleepy
+// half-lid (frame 7) most of the time with the occasional full blink
+// (frame 2). Slow interval; a Zzz label cycles next to the head.
+static const uint8_t ANIM_IDLE[] = {
+    7, 7, 7, 7, 2, 7, 7, 7, 7, 2,
+};
 
 struct anim_phase_def_t {
     const uint8_t* seq;
@@ -823,6 +1019,8 @@ static const anim_phase_def_t PHASE_ANIM[] = {
     /* PHASE_WORKING   */ { ANIM_WORKING,   sizeof(ANIM_WORKING),   320 },
     /* PHASE_THINKING  */ { ANIM_THINKING,  sizeof(ANIM_THINKING),  520 },
     /* PHASE_LIGHTBULB */ { ANIM_LIGHTBULB, sizeof(ANIM_LIGHTBULB), 180 },
+    /* PHASE_DANCE     */ { ANIM_DANCE,     sizeof(ANIM_DANCE),      60 },
+    /* PHASE_IDLE      */ { ANIM_IDLE,      sizeof(ANIM_IDLE),      900 },
 };
 
 // Body bob (vertical) + sway (horizontal) — the sway reads as a gentle
@@ -860,20 +1058,47 @@ void ui_tick_anim(void) {
         walk_last_ms = now;
         static uint16_t bob_idx = 0;
         static uint16_t sway_idx = 0;
+        static uint16_t logo_idx = 0;
         // Wrap inside the active phase's sequence length so a phase
         // swap doesn't index past the end of a shorter array.
         anim_seq_idx = (anim_seq_idx + 1) % def.len;
         bob_idx      = (bob_idx + 1)      % BOB_LEN;
         sway_idx     = (sway_idx + 1)     % SWAY_LEN;
-        lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[anim_seq_idx]));
-        // Lightbulb makes the figure hop a touch higher; thinking holds
-        // it still (no bob/sway) so it reads as concentrating.
-        int sway = SWAY_OFFSETS[sway_idx];
-        int bob  = BOB_OFFSETS[bob_idx];
-        if (cur_phase == PHASE_THINKING) { sway = 0; bob = 0; }
-        else if (cur_phase == PHASE_LIGHTBULB) { bob -= 2; }
-        lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID,
-                     sway, ANIM_BASE_Y + bob);
+
+        if (cur_phase == PHASE_DANCE) {
+            // Boot: Seen Health spinning logo, centered, no bob/sway —
+            // the rotation itself is the motion.
+            logo_idx = (logo_idx + 1) % seen_logo_frame_count();
+            lv_image_set_src(anim_clawd_img, seen_logo_frame(logo_idx));
+            lv_obj_align(anim_clawd_img, LV_ALIGN_CENTER, 0, 0);
+        } else {
+            lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[anim_seq_idx]));
+            // Lightbulb makes the figure hop a touch higher; thinking
+            // holds it still; idle gets a slow shallow breath.
+            int sway = SWAY_OFFSETS[sway_idx];
+            int bob  = BOB_OFFSETS[bob_idx];
+            if (cur_phase == PHASE_THINKING) { sway = 0; bob = 0; }
+            else if (cur_phase == PHASE_LIGHTBULB) { bob -= 2; }
+            else if (cur_phase == PHASE_IDLE) { sway = 0; bob /= 2; }
+            lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID,
+                         sway, ANIM_BASE_Y + bob);
+        }
+    }
+
+    // Zzz cycle — Z → Zz → Zzz → repeat, 700 ms per step. Independent
+    // of the frame interval so the breathing animation can be slow
+    // while the text still ticks at a readable pace.
+    if (anim_zzz_label && cur_phase == PHASE_IDLE) {
+        static uint32_t zzz_last_ms = 0;
+        static uint8_t  zzz_step    = 0;
+        if (now - zzz_last_ms >= 700) {
+            zzz_last_ms = now;
+            zzz_step = (zzz_step + 1) % 3;
+            const char* txt = (zzz_step == 0) ? "Z"
+                            : (zzz_step == 1) ? "Zz"
+                                              : "Zzz";
+            lv_label_set_text(anim_zzz_label, txt);
+        }
     }
 }
 
@@ -920,18 +1145,32 @@ void ui_toggle_splash(void) {
 
 screen_t ui_get_current_screen(void) { return current_screen; }
 
-void ui_handle_shake(void) {
-    // On the overview screen a shake advances the focused session
-    // host-side rather than swapping screens.
+// Roll left or right toggles USAGE↔SPLASH. Either direction does the
+// same thing — what the user wants from rolling is "swap to the other
+// screen", not a fixed left=A / right=B mapping.
+static void roll_toggle_usage_splash(void) {
     if (current_screen == SCREEN_OVERVIEW) {
-        ble_send_control(0x02);
+        manual_screen_override = true;
+        ui_show_screen(SCREEN_USAGE);
         return;
     }
-    // Toggle between USAGE and the working/SPLASH view. Manual choice
-    // sticks until the next turn-start.
     screen_t next = (current_screen == SCREEN_SPLASH) ? SCREEN_USAGE : SCREEN_SPLASH;
     manual_screen_override = true;
     ui_show_screen(next);
+}
+
+void ui_handle_tilt_left(void)  { roll_toggle_usage_splash(); }
+void ui_handle_tilt_right(void) { roll_toggle_usage_splash(); }
+
+void ui_handle_tilt_back(void) {
+    // Pitch back = previous Claude Code session. The daemon decodes
+    // 0x03 as "step back" in the focused-session index. No-op when
+    // only one session is active.
+    if (cached_session_count > 1) ble_send_control(0x03);
+}
+
+void ui_handle_tilt_forward(void) {
+    if (cached_session_count > 1) ble_send_control(0x02);
 }
 
 // BLE status used to drive the (now-retired) Status screen. Keep the symbol
