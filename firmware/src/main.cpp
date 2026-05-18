@@ -237,6 +237,7 @@ void loop(void) {
 
     if (ble_has_data()) {
         if (parse_usage_json(ble_get_data(), &usage)) {
+            ui_payload_received();
             ui_update(&usage);
             ble_send_ack();
         } else {

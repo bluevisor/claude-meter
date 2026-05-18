@@ -89,8 +89,8 @@ static const char* const FRAMES[10][10] = {
     // 8: lightbulb (outline only — bulb pops in)
     {
         "................",
+        "................",
         ".....yyyyyy.....",
-        "....y......y....",
         "....y......y....",
         "....y......y....",
         ".....y....y.....",
@@ -99,16 +99,18 @@ static const char* const FRAMES[10][10] = {
         "......bbbb......",
         ".......bb.......",
     },
-    // 9: lightbulb + rays (the "idea!" flash beat)
+    // 9: lightbulb + rays (the "idea!" flash beat). 8 short straight
+    // rays radiating outward: N, NE, E, SE, SW, W, NW, plus a hint of
+    // bottom edges. Bulb itself is unchanged from frame 8.
     {
-        "y..y...yy...y..y",
-        ".....yyyyyy.....",
-        "..y.y......y.y..",
-        "y...y......y...y",
-        "..y.y......y.y..",
-        ".....y....y.....",
-        "......yyyy......",
-        "......bbbb......",
+        ".......yy.......",   // N ray (2 px straight up)
+        "...y...yy...y...",   // NE/NW diagonal stubs + N base
+        ".....yyyyyy.....",   // bulb top
+        "....y......y....",   // bulb
+        "y...y......y...y",   // W ray + bulb + E ray
+        "..y..y....y..y..",   // SW diag + bulb narrow + SE diag
+        "......yyyy......",   // bulb neck
+        "......bbbb......",   // base
         "......bbbb......",
         ".......bb.......",
     },

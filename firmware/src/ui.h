@@ -10,9 +10,13 @@ enum screen_t {
     SCREEN_COUNT,
 };
 
-// Routed from main.cpp on a double-shake gesture: cycles screens, or on
-// the overview screen advances the focused session via BLE.
+// Routed from main.cpp on a double-shake gesture: toggles
+// USAGE↔SPLASH, or on overview advances the focused session.
 void ui_handle_shake(void);
+
+// Called from main.cpp the moment a payload is received from the
+// daemon. Drives the stale-data watchdog.
+void ui_payload_received(void);
 
 void ui_init(void);
 void ui_update(const UsageData* data);

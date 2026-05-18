@@ -11,9 +11,12 @@
 #define IMU_POLL_MS        20      // 50 Hz
 #define SHAKE_HI           1.45f   // |a| > 1.45 g triggers a spike
 #define SHAKE_LO           1.10f   // need to drop below this between spikes
-#define SPIKE_COOLDOWN_MS  120     // ignore further hi crossings for this long
-#define DOUBLE_WIN_MIN_MS  200
-#define DOUBLE_WIN_MAX_MS  900
+// Snappier double-shake: two spikes inside a short, continuous wrist
+// flick — not "shake … pause … shake". Cooldown is short so the second
+// half of one wrist motion isn't filtered out.
+#define SPIKE_COOLDOWN_MS  60
+#define DOUBLE_WIN_MIN_MS  60
+#define DOUBLE_WIN_MAX_MS  380
 
 static bool      imu_ok = false;
 static uint32_t  last_poll_ms = 0;

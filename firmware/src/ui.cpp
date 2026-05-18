@@ -54,6 +54,28 @@ static lv_obj_t  *anim_ctx_label, *anim_ctx_value, *anim_ctx_bar_bg, *anim_ctx_b
 static lv_obj_t  *anim_bulb        = nullptr;   // small yellow circle for the lightbulb beat
 static lv_obj_t  *anim_thought_dot = nullptr;   // little muted dot for the thinking beat
 
+// Daemon-status indicator. Lives on the active screen, just below the
+// title; shown only when ok=false (e.g. "api_fail", "no_token").
+static lv_obj_t  *status_label    = nullptr;
+
+// Set by ui_handle_shake when the user manually picks a screen, so the
+// auto-switch in ui_update doesn't immediately undo it. Cleared on the
+// next idle→active transition (a fresh turn always re-enters working).
+static bool manual_screen_override = false;
+
+// 6-circle spinner laid out as a 2-col × 3-row dot grid (matches the
+// braille "dots" cli-spinner pattern). Each frame is a 6-bit mask;
+// the cycle rotates a "snake" of lit dots around the perimeter.
+//   bit 0 = top-L   bit 3 = top-R
+//   bit 1 = mid-L   bit 4 = mid-R
+//   bit 2 = bot-L   bit 5 = bot-R
+static lv_obj_t  *spin_container = nullptr;
+static lv_obj_t  *spin_dots[6]   = {};
+static const uint8_t SPIN_MASKS[] = {
+    0x0B, 0x19, 0x39, 0x38, 0x3C, 0x34, 0x26, 0x27, 0x07, 0x0F,
+};
+#define SPIN_MASK_COUNT (sizeof(SPIN_MASKS) / sizeof(SPIN_MASKS[0]))
+
 // ────────────────────── Overview screen widgets ──────────────────────
 #define OVERVIEW_MAX_ROWS 6
 static lv_obj_t  *ov_container = nullptr;
@@ -70,6 +92,17 @@ static UsageMode displayed_mode = MODE_UNKNOWN;
 
 enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB };
 static work_phase_t cur_phase = PHASE_WORKING;
+
+// Stale-data watchdog. Updated whenever a payload arrives; if no
+// payload has shown up in >30s we surface a small red dot in the
+// top-right of every screen.
+static uint32_t  last_payload_ms = 0;
+static lv_obj_t* stale_dot      = nullptr;
+#define STALE_THRESHOLD_MS 30000
+
+void ui_payload_received(void) {
+    last_payload_ms = lv_tick_get();
+}
 static uint16_t     anim_seq_idx = 0;     // reset to 0 on phase change
 
 // Forward decl: definition lives further down with ui_update, but the
@@ -92,12 +125,17 @@ static uint32_t  task_seconds_at_sync = 0;
 static uint32_t  task_sync_tick_ms    = 0;
 static bool      task_active_latched  = false;
 
-// 8-frame "braille" spinner approximated with ASCII chars Montserrat
-// ships with. Reads as a small rotating two-dot indicator.
-static const char* const SPIN_FRAMES[] = {
-    ":  ", ". .", " ..", "  :", ".  ", ":  ", " : ", ":. ",
-};
-#define SPIN_FRAME_COUNT 8
+// Drive the 6-dot spinner from the current mask. Called every frame
+// while the spinner is visible.
+static void tick_spinner(void) {
+    if (!spin_container) return;
+    uint32_t idx = (lv_tick_get() / 110) % SPIN_MASK_COUNT;
+    uint8_t mask = SPIN_MASKS[idx];
+    for (int i = 0; i < 6; i++) {
+        if (mask & (1 << i)) lv_obj_clear_flag(spin_dots[i], LV_OBJ_FLAG_HIDDEN);
+        else                 lv_obj_add_flag(spin_dots[i],   LV_OBJ_FLAG_HIDDEN);
+    }
+}
 
 static void render_working_line(void) {
     uint32_t s = task_seconds_at_sync;
@@ -107,13 +145,25 @@ static void render_working_line(void) {
         uint32_t delta_ms = lv_tick_get() - task_sync_tick_ms;
         s += delta_ms / 1000;
     }
+    // Spinner: while a turn is mid-flight but no output tokens have
+    // landed yet, show the 6-dot braille rotation in place of the
+    // token count — but keep the timer running alongside it.
+    bool waiting = (task_active_latched && task_tokens_latched == 0);
+    if (spin_container) {
+        if (waiting) {
+            lv_obj_clear_flag(spin_container, LV_OBJ_FLAG_HIDDEN);
+            tick_spinner();
+        } else {
+            lv_obj_add_flag(spin_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     char buf[32];
     char tok[16];
-    // Spinner: while a turn is mid-flight but no output tokens have
-    // landed yet, show a rotating dot pattern instead of "0".
-    if (task_active_latched && task_tokens_latched == 0) {
-        uint32_t spin_idx = (lv_tick_get() / 110) % SPIN_FRAME_COUNT;
-        snprintf(tok, sizeof(tok), "%s", SPIN_FRAMES[spin_idx]);
+    if (waiting) {
+        // No tokens yet — leave the spinner in the "tokens" slot and
+        // pad with spaces so the timer lines up where it would when
+        // the count starts arriving (single-digit width).
+        tok[0] = ' '; tok[1] = ' '; tok[2] = ' '; tok[3] = '\0';
     } else if (task_tokens_latched < 1000) {
         snprintf(tok, sizeof(tok), "%u",     (unsigned)task_tokens_latched);
     } else if (task_tokens_latched < 100000) {
@@ -377,6 +427,32 @@ static void init_animation_screen(lv_obj_t* parent) {
     anim_gen_pct = make_label(anim_container, &lv_font_montserrat_36, THEME_ACCENT, "--");
     lv_obj_align(anim_gen_pct, LV_ALIGN_TOP_MID, 0, 156);
 
+    // Braille-style spinner: 6 small filled circles arranged in a 2x3
+    // grid. Hidden by default; shown in place of the token count while
+    // a turn is mid-flight before any output tokens arrive.
+    const int dot_d = 7;     // circle diameter
+    const int gap_x = 9;     // column spacing
+    const int gap_y = 8;     // row spacing
+    const int cont_w = dot_d + gap_x;
+    const int cont_h = dot_d * 3 + gap_y * 2;
+    spin_container = make_pane(anim_container, 0, 0, cont_w, cont_h);
+    // Left of center — overlaps the token slot of the centered label
+    // so the spinner reads as "in place of the token count", with the
+    // timer remaining to its right.
+    lv_obj_align(spin_container, LV_ALIGN_TOP_MID, -52, 168);
+    lv_obj_add_flag(spin_container, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < 6; i++) {
+        spin_dots[i] = lv_obj_create(spin_container);
+        lv_obj_remove_style_all(spin_dots[i]);
+        lv_obj_set_size(spin_dots[i], dot_d, dot_d);
+        lv_obj_set_style_radius(spin_dots[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(spin_dots[i], THEME_ACCENT, 0);
+        lv_obj_set_style_bg_opa(spin_dots[i], LV_OPA_COVER, 0);
+        int col = i / 3;     // 0 = left column, 1 = right column
+        int row = i % 3;
+        lv_obj_set_pos(spin_dots[i], col * gap_x, row * (dot_d + gap_y));
+    }
+
     // Progress bar removed; stubs kept for back-compat with existing refs.
     anim_gen_bar_bg   = make_pane(anim_container, MARGIN, 180, SCR_W - 2 * MARGIN, 0);
     anim_gen_bar_fill = make_pane(anim_container, MARGIN, 180, 0, 0);
@@ -487,6 +563,23 @@ void ui_init(void) {
     lv_obj_add_flag(api_container,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ov_container,   LV_OBJ_FLAG_HIDDEN);
+
+    // Daemon-status banner — top-center, just below the title row.
+    // Shown only when the daemon reports ok=false.
+    status_label = make_label(scr, &lv_font_montserrat_14, THEME_RED, "");
+    lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+
+    // Stale-data indicator — small red dot pinned top-right; lives on
+    // the active screen object so it overlays whatever else is shown.
+    stale_dot = lv_obj_create(scr);
+    lv_obj_remove_style_all(stale_dot);
+    lv_obj_set_size(stale_dot, 6, 6);
+    lv_obj_set_style_radius(stale_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(stale_dot, THEME_RED, 0);
+    lv_obj_set_style_bg_opa(stale_dot, LV_OPA_COVER, 0);
+    lv_obj_align(stale_dot, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_flag(stale_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void apply_mode_visibility(void) {
@@ -539,6 +632,23 @@ void ui_update(const UsageData* data) {
     // Overview is independent of the working/idle flip; always refresh
     // it so when the user shakes to it the rows are current.
     render_overview(data);
+
+    // Daemon health: surface `st` only when the daemon reports trouble.
+    // "allowed" / "session" / "ok" are quiet states; anything else (e.g.
+    // "api_fail", "no_token") gets a small red banner under the title.
+    if (status_label) {
+        bool show_status = !data->ok || (
+            data->status[0] && strcmp(data->status, "allowed") != 0
+                            && strcmp(data->status, "session") != 0
+                            && strcmp(data->status, "ok")      != 0
+                            && strcmp(data->status, "unknown") != 0);
+        if (show_status) {
+            lv_label_set_text(status_label, data->status);
+            lv_obj_clear_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(status_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     if (data->mode == MODE_API) {
         int pct = 0;
@@ -656,18 +766,22 @@ void ui_update(const UsageData* data) {
         else                             lv_obj_add_flag(anim_thought_dot,   LV_OBJ_FLAG_HIDDEN);
     }
 
-    // Auto-switch: when Claude Code is mid-turn, jump to the working/anim
-    // view; when it goes idle, return to the usage view. We only react to
-    // *transitions* so a touch toggle isn't fought against on every push.
+    // Auto-switch: when Claude Code is mid-turn, jump to the working
+    // view; when it goes idle, return to the usage view. A turn-start
+    // (idle → active) always wins — it clears any manual override and
+    // forces the working view. Idle transition only auto-switches if
+    // the user hasn't shaken to override.
     static bool last_active_known = false;
     static bool last_active = false;
     bool act = data->session_active;
     if (!last_active_known || act != last_active) {
+        bool became_active = act && !last_active;
         last_active_known = true;
         last_active = act;
-        if (act && current_screen != SCREEN_SPLASH) {
-            ui_show_screen(SCREEN_SPLASH);
-        } else if (!act && current_screen == SCREEN_SPLASH) {
+        if (became_active) {
+            manual_screen_override = false;
+            if (current_screen != SCREEN_SPLASH) ui_show_screen(SCREEN_SPLASH);
+        } else if (!act && current_screen == SCREEN_SPLASH && !manual_screen_override) {
             ui_show_screen(SCREEN_USAGE);
         }
     }
@@ -691,12 +805,13 @@ static const uint8_t ANIM_THINKING[] = {
     7, 7, 3, 3, 4, 4, 5, 5,
     7, 3, 0, 7, 3, 2,
 };
-// "Lightbulb" cycle — the figure is replaced by a yellow bulb (frame
-// 8, outline only), holds for a beat, then flashes once with rays
-// (frame 9), then holds again. The sequence index is reset on phase
-// entry so the flash always reads as a single discrete event.
+// "Lightbulb" cycle — short and discrete: bulb pops in, flashes its
+// rays once on the second frame, then sits as a plain outline while
+// the daemon's lightbulb window (~1.2s) runs out. Padded with extra
+// plain-bulb frames so the sequence doesn't loop back to the flash
+// before Clawd returns. Sequence index resets to 0 on phase entry.
 static const uint8_t ANIM_LIGHTBULB[] = {
-    8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 9, 8, 8, 8, 8, 8, 8,
 };
 
 struct anim_phase_def_t {
@@ -707,7 +822,7 @@ struct anim_phase_def_t {
 static const anim_phase_def_t PHASE_ANIM[] = {
     /* PHASE_WORKING   */ { ANIM_WORKING,   sizeof(ANIM_WORKING),   320 },
     /* PHASE_THINKING  */ { ANIM_THINKING,  sizeof(ANIM_THINKING),  520 },
-    /* PHASE_LIGHTBULB */ { ANIM_LIGHTBULB, sizeof(ANIM_LIGHTBULB), 220 },
+    /* PHASE_LIGHTBULB */ { ANIM_LIGHTBULB, sizeof(ANIM_LIGHTBULB), 180 },
 };
 
 // Body bob (vertical) + sway (horizontal) — the sway reads as a gentle
@@ -719,8 +834,17 @@ static const int8_t SWAY_OFFSETS[] = { 0, -1, -2, -2, -1, 0, 1, 2, 2, 1 };
 #define ANIM_BASE_Y 20
 
 void ui_tick_anim(void) {
-    if (current_screen != SCREEN_SPLASH) return;
     uint32_t now = lv_tick_get();
+    // Stale-data dot — independent of which screen is shown. Hidden
+    // before the first payload arrives so a cold boot doesn't flash it.
+    if (stale_dot) {
+        bool stale = (last_payload_ms != 0)
+                  && (now - last_payload_ms > STALE_THRESHOLD_MS);
+        if (stale) lv_obj_clear_flag(stale_dot, LV_OBJ_FLAG_HIDDEN);
+        else       lv_obj_add_flag(stale_dot,   LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (current_screen != SCREEN_SPLASH) return;
 
     // Refresh the working line frequently while active so the spinner
     // animates smoothly. Cheap — just one lv_label_set_text call.
@@ -797,21 +921,16 @@ void ui_toggle_splash(void) {
 screen_t ui_get_current_screen(void) { return current_screen; }
 
 void ui_handle_shake(void) {
-    // On the overview screen a double-shake advances the focused
-    // session — the daemon hears the 0x02 control byte and starts
-    // pushing that session's data. Anywhere else a double-shake
-    // cycles screens (usage → overview → splash → usage).
+    // On the overview screen a shake advances the focused session
+    // host-side rather than swapping screens.
     if (current_screen == SCREEN_OVERVIEW) {
         ble_send_control(0x02);
         return;
     }
-    screen_t next;
-    switch (current_screen) {
-        case SCREEN_USAGE:    next = SCREEN_OVERVIEW; break;
-        case SCREEN_OVERVIEW: next = SCREEN_SPLASH;   break;
-        case SCREEN_SPLASH:   next = SCREEN_USAGE;    break;
-        default:              next = SCREEN_USAGE;    break;
-    }
+    // Toggle between USAGE and the working/SPLASH view. Manual choice
+    // sticks until the next turn-start.
+    screen_t next = (current_screen == SCREEN_SPLASH) ? SCREEN_USAGE : SCREEN_SPLASH;
+    manual_screen_override = true;
     ui_show_screen(next);
 }
 

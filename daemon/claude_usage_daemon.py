@@ -54,11 +54,14 @@ RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
-TICK = 5
+# Loop period — controls how fast the daemon notices a JSONL write
+# (i.e. how fast the meter flips to working mode after Enter). 300ms
+# is "feels instant" without burning host CPU on dir scans.
+TICK = 0.3
 SCAN_TIMEOUT = 8.0
 # When session is active, push at least this often so the on-device
-# timer stays anchored — but the firmware advances seconds locally
-# between pushes, so we don't need 1-Hz traffic.
+# timer stays anchored — the firmware advances seconds locally
+# between pushes so we don't need 1-Hz BLE traffic.
 ACTIVE_SYNC_INTERVAL = 15
 
 # Claude Code transcript discovery.
@@ -230,7 +233,11 @@ async def poll_subscription(token: str) -> dict | None:
             resp = await http.post(API_URL, headers=headers, json=API_BODY)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
-        return None
+        # Emit a stub payload so the firmware can surface "api_fail"
+        # under the title instead of just freezing on the last good
+        # numbers. ok=False signals everything else is unreliable.
+        return {"mode": "subscription", "s": 0, "sr": -1, "w": 0, "wr": -1,
+                "st": "api_fail", "ok": False}
 
     def hdr(name: str, default: str = "0") -> str:
         return resp.headers.get(name, default)
@@ -451,85 +458,143 @@ def _is_real_user_message(content: object) -> bool:
     return False
 
 
+# Per-JSONL incremental cache. Lets read_session_usage() skip re-parsing
+# the entire transcript on every poll — we just tail the new bytes and
+# fold them into the running totals. Keyed by absolute path.
+_jsonl_cache: dict[Path, dict] = {}
+
+
+def _fresh_state() -> dict:
+    return {
+        "offset": 0,
+        "mtime":  0.0,
+        "last_usage":   None,
+        "last_model":   None,
+        "last_ts":      None,
+        "first_ts":     None,
+        "total_input":  0,
+        "total_output": 0,
+        "total_cache_read":  0,
+        "total_cache_write": 0,
+        "task_start_ts":      None,
+        "task_output_tokens": 0,
+        "prev_block_type": None,
+        "last_block_type": None,
+        "last_block_ts":   None,
+    }
+
+
+def _fold_line(state: dict, line: str) -> None:
+    line = line.strip()
+    if not line:
+        return
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    t = obj.get("type")
+    ts = _parse_iso_timestamp(obj.get("timestamp", ""))
+    if t == "user":
+        msg = obj.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if _is_real_user_message(content):
+            state["task_start_ts"] = ts
+            state["task_output_tokens"] = 0
+        return
+    if t != "assistant":
+        return
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return
+    if ts is not None:
+        if state["first_ts"] is None or ts < state["first_ts"]:
+            state["first_ts"] = ts
+        state["last_ts"] = ts
+    state["last_usage"] = usage
+    state["last_model"] = msg.get("model") or state["last_model"]
+    out_tok = int(usage.get("output_tokens", 0) or 0)
+    state["total_input"]  += int(usage.get("input_tokens", 0) or 0)
+    state["total_output"] += out_tok
+    state["total_cache_write"] += int(usage.get("cache_creation_input_tokens", 0) or 0)
+    state["total_cache_read"]  += int(usage.get("cache_read_input_tokens", 0) or 0)
+    if state["task_start_ts"] is not None and (ts is None or ts >= state["task_start_ts"]):
+        state["task_output_tokens"] += out_tok
+    content = msg.get("content")
+    block_type: str | None = None
+    if isinstance(content, list) and content:
+        head = content[0]
+        if isinstance(head, dict):
+            block_type = head.get("type")
+    if block_type:
+        state["prev_block_type"] = state["last_block_type"]
+        state["last_block_type"] = block_type
+        state["last_block_ts"]   = ts
+
+
 def read_session_usage(jsonl: Path) -> dict | None:
-    """Scan a JSONL transcript and summarize the current session."""
-    last_usage: dict | None = None
-    last_model: str | None = None
-    last_ts: float | None = None
-    first_ts: float | None = None
-    total_input  = 0
-    total_output = 0
-    total_cache_read = 0
-    total_cache_write = 0
-    # "Current task" = since the most recent human user message. Tool
-    # results show up as user-type entries too, so we filter them out.
-    task_start_ts: float | None = None
-    task_output_tokens: int = 0
-    # Track the last two assistant content-block types + timestamp so we
-    # can derive a "thinking" or "lightbulb" phase for the UI.
-    prev_block_type: str | None = None
-    last_block_type: str | None = None
-    last_block_ts: float | None = None
+    """Tail-parse a JSONL transcript and summarize the current session.
+
+    Uses _jsonl_cache so repeated polls only read new bytes since the
+    last call. If the file got rewritten or truncated the cache entry
+    is rebuilt from scratch.
+    """
+    try:
+        st = jsonl.stat()
+    except OSError as e:
+        log(f"stat({jsonl}) failed: {e}")
+        return None
+    state = _jsonl_cache.get(jsonl)
+    # Cache miss, file rewritten (older mtime), or truncated (smaller).
+    if state is None or st.st_mtime < state["mtime"] or st.st_size < state["offset"]:
+        state = _fresh_state()
+        _jsonl_cache[jsonl] = state
     try:
         with jsonl.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                t = obj.get("type")
-                ts = _parse_iso_timestamp(obj.get("timestamp", ""))
-                if t == "user":
-                    msg = obj.get("message")
-                    content = msg.get("content") if isinstance(msg, dict) else None
-                    if _is_real_user_message(content):
-                        # New task boundary — reset the running counters.
-                        task_start_ts = ts
-                        task_output_tokens = 0
-                    continue
-                if t != "assistant":
-                    continue
-                msg = obj.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                usage = msg.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                if ts is not None:
-                    if first_ts is None or ts < first_ts:
-                        first_ts = ts
-                    last_ts = ts
-                last_usage = usage
-                last_model = msg.get("model") or last_model
-                out_tok = int(usage.get("output_tokens", 0) or 0)
-                total_input  += int(usage.get("input_tokens", 0) or 0)
-                total_output += out_tok
-                total_cache_write += int(usage.get("cache_creation_input_tokens", 0) or 0)
-                total_cache_read  += int(usage.get("cache_read_input_tokens", 0) or 0)
-                if task_start_ts is not None and (ts is None or ts >= task_start_ts):
-                    task_output_tokens += out_tok
-                # Capture this message's first content-block type for the
-                # phase heuristic. Claude Code writes one block per
-                # assistant message in this transcript.
-                content = msg.get("content")
-                block_type: str | None = None
-                if isinstance(content, list) and content:
-                    head = content[0]
-                    if isinstance(head, dict):
-                        block_type = head.get("type")
-                if block_type:
-                    prev_block_type = last_block_type
-                    last_block_type = block_type
-                    last_block_ts = ts
+            f.seek(state["offset"])
+            buf = f.read()
+            new_offset = f.tell()
     except OSError as e:
         log(f"Reading session JSONL failed: {e}")
         return None
+    # Process complete lines only; stash a trailing partial in the
+    # cache by rewinding the offset just before it. JSONL writes are
+    # usually line-atomic but a race during a tool result write is
+    # cheap to recover from this way.
+    if buf:
+        if buf.endswith("\n"):
+            lines = buf.splitlines()
+            consumed = new_offset
+        else:
+            last_nl = buf.rfind("\n")
+            if last_nl < 0:
+                lines = []
+                consumed = state["offset"]
+            else:
+                lines = buf[:last_nl].splitlines()
+                consumed = state["offset"] + last_nl + 1
+        for line in lines:
+            _fold_line(state, line)
+        state["offset"] = consumed
+    state["mtime"] = st.st_mtime
 
+    last_usage = state["last_usage"]
+    last_model = state["last_model"]
     if last_usage is None:
         return None
+    last_ts            = state["last_ts"]
+    first_ts           = state["first_ts"]
+    total_input        = state["total_input"]
+    total_output       = state["total_output"]
+    total_cache_read   = state["total_cache_read"]
+    total_cache_write  = state["total_cache_write"]
+    task_start_ts      = state["task_start_ts"]
+    task_output_tokens = state["task_output_tokens"]
+    prev_block_type    = state["prev_block_type"]
+    last_block_type    = state["last_block_type"]
+    last_block_ts      = state["last_block_ts"]
 
     ctx_used = (
         int(last_usage.get("input_tokens", 0) or 0)
@@ -568,7 +633,7 @@ def read_session_usage(jsonl: Path) -> dict | None:
     if last_block_type == "thinking" and last_block_ts and (now - last_block_ts) < 6:
         phase = "thinking"
     elif (prev_block_type == "thinking" and last_block_type in ("text", "tool_use")
-          and last_block_ts and (now - last_block_ts) < 4):
+          and last_block_ts and (now - last_block_ts) < 1.2):
         phase = "lightbulb"
 
     return {
@@ -710,7 +775,11 @@ async def poll_usage() -> dict | None:
         base = await poll_api_billing(cfg)
     else:
         token = read_token()
-        if token:
+        if not token:
+            # No credentials at all — surface this on the device.
+            base = {"mode": "subscription", "s": 0, "sr": -1, "w": 0, "wr": -1,
+                    "st": "no_token", "ok": False}
+        else:
             base = await poll_subscription(token)
 
     session = await read_session_payload()
