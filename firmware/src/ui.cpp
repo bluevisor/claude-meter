@@ -75,15 +75,18 @@ static bool manual_screen_override = false;
 // there's only one session to cycle through. Updated in ui_update().
 static uint8_t cached_session_count = 1;
 
-// Full-screen black rectangle used to cross-fade between the boot
-// dance and whatever screen the first payload puts us on. The backlight
-// isn't software-controllable on this board, so the "fade to black" is
-// achieved by animating an overlay's bg_opa. (bf_pending_phase lives
-// further down once work_phase_t is defined.)
+// Software-faked backlight fade. The Waveshare LCD-1.3 has the
+// backlight hardwired (no PWM), so we simulate a smooth dip-to-black
+// by animating a full-screen black overlay's bg_opa with an
+// ease-in-out curve on each half. The boot → data UI swap happens at
+// the midpoint when the overlay is fully opaque, so the user never
+// sees the layout change — only the screen dim, hold black, then
+// brighten on the new view. bf_target_phase lives further down once
+// work_phase_t is defined.
 static lv_obj_t* fade_overlay = nullptr;
 enum boot_fade_state_t { BFS_IDLE, BFS_FADING_OUT, BFS_FADING_IN };
 static boot_fade_state_t bf_state = BFS_IDLE;
-#define BOOT_FADE_HALF_MS 600   // 1.2 s total (fade-to-black + reveal)
+#define BOOT_FADE_HALF_MS 600   // 600 ms fade-out + 600 ms fade-in = 1.2 s total
 
 // 6-circle spinner laid out as a 2-col × 3-row dot grid (matches the
 // braille "dots" cli-spinner pattern). Each frame is a 6-bit mask;
@@ -113,12 +116,23 @@ static screen_t  current_screen = SCREEN_USAGE;
 static UsageMode displayed_mode = MODE_UNKNOWN;
 
 enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB, PHASE_DANCE, PHASE_IDLE };
-static work_phase_t bf_pending_phase = PHASE_WORKING;   // see fade_overlay block above
+// Target phase for the boot fade. Captured when fade-out starts and
+// applied at the midpoint swap. Tracked separately from cur_phase so
+// the dance keeps running behind the dimming overlay until we're
+// actually black.
+static work_phase_t bf_target_phase = PHASE_WORKING;
 // Cold boot starts in PHASE_DANCE — Clawd dances on the splash screen
 // until the daemon delivers its first payload. ui_update() flips us
 // into a data-driven phase as soon as anything lands (PHASE_IDLE when
 // no task is active, PHASE_WORKING/THINKING/LIGHTBULB otherwise).
 static work_phase_t cur_phase = PHASE_DANCE;
+// Latch so the lightbulb beat plays exactly once per
+// thinking → working transition. Armed (false) whenever we enter
+// PHASE_THINKING; set (true) by ui_tick_anim the moment the
+// two-frame bulb sequence finishes. While set, subsequent daemon
+// "lightbulb" pings within the ~1.2s window are downgraded to
+// PHASE_WORKING so the bulb doesn't blink in and out repeatedly.
+static bool bulb_already_played = false;
 
 // Stale-data watchdog. Updated whenever a payload arrives; if no
 // payload has shown up in >30s we surface a small red dot in the
@@ -534,14 +548,16 @@ static void fade_in_done_cb(lv_anim_t* a) {
 
 static void fade_out_done_cb(lv_anim_t* a) {
     (void)a;
-    // We're under a fully-opaque overlay; swap the visual state now so
-    // the user only sees the destination once we fade back in.
-    cur_phase    = bf_pending_phase;
+    // Screen is fully black under an opaque overlay. Hard-swap the
+    // UI now — the user can't see anything, so this is invisible.
+    cur_phase    = bf_target_phase;
     walk_last_ms = 0;
     anim_seq_idx = 0;
     apply_boot_dance_layout(false);
 
-    // Reverse fade — reveal the new screen.
+    // Fade the overlay back out to reveal the new view. Same duration
+    // and easing as the fade-out, so the dip-to-black-and-back reads
+    // as one symmetric motion.
     bf_state = BFS_FADING_IN;
     lv_anim_t b;
     lv_anim_init(&b);
@@ -549,25 +565,31 @@ static void fade_out_done_cb(lv_anim_t* a) {
     lv_anim_set_values(&b, 255, 0);
     lv_anim_set_duration(&b, BOOT_FADE_HALF_MS);
     lv_anim_set_exec_cb(&b, fade_set_opa);
+    lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
     lv_anim_set_completed_cb(&b, fade_in_done_cb);
     lv_anim_start(&b);
 }
 
 static void start_boot_fade(work_phase_t target_phase) {
     if (!fade_overlay || bf_state != BFS_IDLE) return;
-    bf_pending_phase = target_phase;
-    bf_state         = BFS_FADING_OUT;
+    bf_target_phase = target_phase;
+    bf_state        = BFS_FADING_OUT;
 
     lv_obj_set_style_bg_opa(fade_overlay, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(fade_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(fade_overlay);
 
+    // Ease-in-out so the fade has zero velocity at the start (boot
+    // dance still bright) and at the end (fully black), which makes
+    // the two halves butt up against each other smoothly instead of
+    // reading as a linear ramp that suddenly reverses.
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, fade_overlay);
     lv_anim_set_values(&a, 0, 255);
     lv_anim_set_duration(&a, BOOT_FADE_HALF_MS);
     lv_anim_set_exec_cb(&a, fade_set_opa);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_set_completed_cb(&a, fade_out_done_cb);
     lv_anim_start(&a);
 }
@@ -919,25 +941,36 @@ void ui_update(const UsageData* data) {
     // active we drop into PHASE_IDLE so Clawd visibly naps instead of
     // pretending to still be working.
     work_phase_t new_phase = PHASE_WORKING;
-    if (!data->session_active)                 new_phase = PHASE_IDLE;
-    else if (strcmp(data->phase, "thinking")  == 0) new_phase = PHASE_THINKING;
-    else if (strcmp(data->phase, "lightbulb") == 0) new_phase = PHASE_LIGHTBULB;
+    if (!data->session_active) new_phase = PHASE_IDLE;
+    else if (strcmp(data->phase, "thinking") == 0) {
+        new_phase = PHASE_THINKING;
+        bulb_already_played = false;   // arm for the next end-of-thinking
+    }
+    else if (strcmp(data->phase, "lightbulb") == 0) {
+        // First lightbulb ping after thinking → play the bulb beat.
+        // Subsequent pings within the daemon's 1.2s window collapse
+        // to plain working so the bulb stays a one-shot moment.
+        new_phase = bulb_already_played ? PHASE_WORKING : PHASE_LIGHTBULB;
+    }
     if (new_phase != cur_phase) {
         if (cur_phase == PHASE_DANCE) {
-            // Boot → data view. Don't change cur_phase yet — the
-            // fade-out callback applies the swap once the overlay is
-            // fully opaque, so the logo keeps spinning behind the fade.
-            start_boot_fade(new_phase);
+            // Boot → data view. cur_phase stays at PHASE_DANCE so
+            // the logo keeps spinning behind the dimming overlay;
+            // the swap happens at the midpoint when the screen is
+            // fully black (fade_out_done_cb).
+            if (bf_state == BFS_FADING_OUT) {
+                // Already mid-fade — daemon's pick changed (e.g.
+                // session went active → idle between trigger and
+                // midpoint). Re-aim the swap target.
+                bf_target_phase = new_phase;
+            } else {
+                start_boot_fade(new_phase);
+            }
         } else {
             cur_phase    = new_phase;
             walk_last_ms = 0;
             anim_seq_idx = 0;
         }
-    } else if (bf_state == BFS_FADING_OUT) {
-        // While fading out the swap target may change (e.g. data went
-        // active→idle between the fade trigger and now). Keep the
-        // pending phase up to date so we land on the right thing.
-        bf_pending_phase = new_phase;
     }
     if (anim_bulb) {
         if (cur_phase == PHASE_LIGHTBULB) lv_obj_clear_flag(anim_bulb, LV_OBJ_FLAG_HIDDEN);
@@ -991,14 +1024,12 @@ static const uint8_t ANIM_THINKING[] = {
     7, 7, 3, 3, 4, 4, 5, 5,
     7, 3, 0, 7, 3, 2,
 };
-// "Lightbulb" cycle — short and discrete: bulb pops in, flashes its
-// rays once on the second frame, then sits as a plain outline while
-// the daemon's lightbulb window (~1.2s) runs out. Padded with extra
-// plain-bulb frames so the sequence doesn't loop back to the flash
-// before Clawd returns. Sequence index resets to 0 on phase entry.
-static const uint8_t ANIM_LIGHTBULB[] = {
-    8, 9, 8, 8, 8, 8, 8, 8,
-};
+// "Lightbulb" cycle — exactly two frames: bulb-without-light then
+// bulb-with-light. After the second frame plays, ui_tick_anim forces
+// us into PHASE_WORKING (see below) so the bulb only ever appears
+// once per thinking → working transition, even though the daemon
+// keeps reporting "lightbulb" for the rest of its ~1.2s window.
+static const uint8_t ANIM_LIGHTBULB[] = { 8, 9 };
 // PHASE_DANCE doesn't index Clawd frames — the tick loop substitutes
 // the Seen Health spinning logo. This stub just satisfies the
 // phase-table struct (length/interval are read; .seq[] is not).
@@ -1052,18 +1083,29 @@ void ui_tick_anim(void) {
         render_working_line();
     }
 
-    const anim_phase_def_t& def = PHASE_ANIM[cur_phase];
+    const anim_phase_def_t* def = &PHASE_ANIM[cur_phase];
 
-    if (now - walk_last_ms >= def.interval_ms) {
+    if (now - walk_last_ms >= def->interval_ms) {
         walk_last_ms = now;
         static uint16_t bob_idx = 0;
         static uint16_t sway_idx = 0;
         static uint16_t logo_idx = 0;
         // Wrap inside the active phase's sequence length so a phase
         // swap doesn't index past the end of a shorter array.
-        anim_seq_idx = (anim_seq_idx + 1) % def.len;
+        anim_seq_idx = (anim_seq_idx + 1) % def->len;
         bob_idx      = (bob_idx + 1)      % BOB_LEN;
         sway_idx     = (sway_idx + 1)     % SWAY_LEN;
+
+        // Lightbulb is a one-shot. Once we wrap from the lit frame
+        // back to index 0, swap into the working cycle for the rest
+        // of the daemon's lightbulb window. The latch prevents
+        // ui_set_data from putting us back into LIGHTBULB.
+        if (cur_phase == PHASE_LIGHTBULB && anim_seq_idx == 0) {
+            cur_phase           = PHASE_WORKING;
+            anim_seq_idx        = 0;
+            bulb_already_played = true;
+            def                 = &PHASE_ANIM[PHASE_WORKING];
+        }
 
         if (cur_phase == PHASE_DANCE) {
             // Boot: Seen Health spinning logo, centered, no bob/sway —
@@ -1072,7 +1114,7 @@ void ui_tick_anim(void) {
             lv_image_set_src(anim_clawd_img, seen_logo_frame(logo_idx));
             lv_obj_align(anim_clawd_img, LV_ALIGN_CENTER, 0, 0);
         } else {
-            lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[anim_seq_idx]));
+            lv_image_set_src(anim_clawd_img, clawd_sprite_large(def->seq[anim_seq_idx]));
             // Lightbulb makes the figure hop a touch higher; thinking
             // holds it still; idle gets a slow shallow breath.
             int sway = SWAY_OFFSETS[sway_idx];

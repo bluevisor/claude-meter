@@ -96,11 +96,13 @@ static const char* const FRAMES[10][10] = {
         "..############..", "..############..",
         "...#.#....#.#...", "...#.#....#.#...",
     },
-    // 8: lightbulb (outline only — bulb pops in)
+    // 8: lightbulb (no light yet). Rounded crown — the top row is only
+    // 4 px wide and the row below flares to 6 px, so it reads as a dome
+    // instead of a flat shelf.
     {
         "................",
-        "................",
-        ".....yyyyyy.....",
+        "......yyyy......",
+        ".....y....y.....",
         "....y......y....",
         "....y......y....",
         ".....y....y.....",
@@ -109,18 +111,21 @@ static const char* const FRAMES[10][10] = {
         "......bbbb......",
         ".......bb.......",
     },
-    // 9: lightbulb + rays (the "idea!" flash beat). 8 short straight
-    // rays radiating outward: N, NE, E, SE, SW, W, NW, plus a hint of
-    // bottom edges. Bulb itself is unchanged from frame 8.
+    // 9: lightbulb lit (the "idea!" beat). One ray in each of the
+    // seven outward directions — N(2), NW, NE, W, E, SW, SE — all
+    // equal weight so the light reads as omnidirectional rather than
+    // a torch pointed up. South is intentionally skipped because the
+    // base sits there and a downward ray would emanate from the gray
+    // metal cap. Bulb silhouette is unchanged from frame 8.
     {
-        ".......yy.......",   // N ray (2 px straight up)
-        "...y...yy...y...",   // NE/NW diagonal stubs + N base
-        ".....yyyyyy.....",   // bulb top
-        "....y......y....",   // bulb
-        "y...y......y...y",   // W ray + bulb + E ray
-        "..y..y....y..y..",   // SW diag + bulb narrow + SE diag
+        "....y..yy..y....",   // NW + N(2) + NE
+        "......yyyy......",   // bulb top
+        ".....y....y.....",
+        "....y......y....",
+        "y...y......y...y",   // W + bulb widest + E
+        "..y..y....y..y..",   // SW + bulb + SE
         "......yyyy......",   // bulb neck
-        "......bbbb......",   // base
+        "......bbbb......",
         "......bbbb......",
         ".......bb.......",
     },
