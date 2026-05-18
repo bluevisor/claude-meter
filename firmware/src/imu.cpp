@@ -4,41 +4,32 @@
 #include <math.h>
 
 // Tilt-only gesture detector. Two independent state machines, one per
-// axis. A gesture fires the instant the chip crosses the threshold —
-// no hold time. The axis must return to "roughly resting" before it
-// can fire again.
+// axis. Fires the instant the chip crosses the threshold — no hold
+// time. The axis must return to "roughly resting" before it can fire
+// again.
 //
-// Key trick: the chip is mounted at a fixed angle inside its housing
-// (the desk wedge tips the whole thing forward ~30-45°), so the raw
-// `ax` / `ay` values at rest are *not* zero. We track a slow IIR
-// baseline that follows the rest orientation, and measure tilts
-// relative to *that* baseline. The baseline only adapts while the
-// chip is near-rest, so the user can hold a tilt indefinitely without
-// it being absorbed into the baseline.
+// We threshold in *degrees*, not raw g. The chip is mounted at a
+// fixed ~23° pitch (the desk wedge), so its resting `ay` reads ~0.38
+// instead of 0. A flat g-threshold then needs ~40° of physical tilt
+// on pitch to reach (sin is non-linear) while roll triggers at 30°.
+// Converting via asin → degrees and subtracting a hardcoded rest
+// offset normalises both axes so 30° feels like 30° in either.
+//
+// Adjust REST_*_DEG if the mount geometry ever changes. To inspect
+// the live raw values, send the serial command "imu" — the firmware
+// will stream `ax/ay/az g, roll/pitch deg` until you send "stop".
 //
 // ROLL  (chip's X axis) → toggle USAGE↔SPLASH
 // PITCH (Y axis)        → cycle Claude Code sessions
-//
-// Threshold = sin(30°) = 0.50 g. Re-arm below ~sin(12°) ≈ 0.20 g.
 
 #define IMU_POLL_MS             10
-#define TILT_AXIS_THRESH        0.50f     // sin(30°)
-#define TILT_AXIS_NEUTRAL       0.20f     // ~sin(12°)
-// Slow IIR that follows the rest orientation. α=0.002 at 100 Hz →
-// ~5 s time constant. Plenty of room for the user to hold a tilt
-// without it being pulled into the baseline.
-#define BASELINE_ALPHA          0.002f
-// Only update the baseline while the chip is near-rest, so a held
-// tilt doesn't drag the baseline along with it.
-#define BASELINE_UPDATE_BAND    0.30f
+#define REST_ROLL_DEG           0.0f
+#define REST_PITCH_DEG          23.0f     // wedge tips the chip forward
+#define TILT_THRESH_DEG         30.0f     // gesture fires past this angle
+#define TILT_NEUTRAL_DEG        12.0f     // re-arm below this angle
 
 static bool      imu_ok = false;
 static uint32_t  last_poll_ms = 0;
-
-// Resting-orientation baseline. Initialised on the first sample,
-// updated slowly thereafter.
-static bool   baseline_init = false;
-static float  bx = 0.0f, by = 0.0f;
 
 struct tilt_axis_t {
     bool      ready;           // false until axis returns to neutral
@@ -60,21 +51,27 @@ void imu_init(void) {
         SensorQMI8658::LPF_MODE_3);
     imu.enableAccelerometer();
     imu_ok = true;
-    Serial.println("QMI8658 init OK (relative-tilt, 42°)");
+    Serial.println("QMI8658 init OK (degree-tilt, 30° threshold)");
 }
 
-static void update_axis(tilt_axis_t& s, float v, const char* label) {
-    if (fabsf(v) < TILT_AXIS_NEUTRAL) s.ready = true;
+static inline float g_to_deg(float v) {
+    if (v >  1.0f) v =  1.0f;
+    if (v < -1.0f) v = -1.0f;
+    return asinf(v) * (180.0f / (float)M_PI);
+}
+
+static void update_axis(tilt_axis_t& s, float rel_deg, const char* label) {
+    if (fabsf(rel_deg) < TILT_NEUTRAL_DEG) s.ready = true;
     if (!s.ready) return;
 
-    if (v >  TILT_AXIS_THRESH) {
+    if (rel_deg >  TILT_THRESH_DEG) {
         s.pos_latched = true;
         s.ready       = false;
-        Serial.printf("[imu] tilt %s + (rel=%.2f)\n", label, v);
-    } else if (v < -TILT_AXIS_THRESH) {
+        Serial.printf("[imu] tilt %s + (%.1f deg)\n", label, rel_deg);
+    } else if (rel_deg < -TILT_THRESH_DEG) {
         s.neg_latched = true;
         s.ready       = false;
-        Serial.printf("[imu] tilt %s - (rel=%.2f)\n", label, v);
+        Serial.printf("[imu] tilt %s - (%.1f deg)\n", label, rel_deg);
     }
 }
 
@@ -89,26 +86,11 @@ void imu_tick(void) {
     if (!imu.getAccelerometer(ax, ay, az)) return;
     (void)az;
 
-    if (!baseline_init) {
-        bx = ax; by = ay;
-        baseline_init = true;
-        return;
-    }
+    float roll_rel  = g_to_deg(ax) - REST_ROLL_DEG;
+    float pitch_rel = g_to_deg(ay) - REST_PITCH_DEG;
 
-    // Tilt relative to the rest baseline.
-    float drx = ax - bx;
-    float dry = ay - by;
-
-    // Only let the baseline adapt while we're close to its current
-    // value. Holding a tilt freezes the baseline, so the tilt signal
-    // stays large and the gesture stays "armed" or "fired" cleanly.
-    if (fabsf(drx) < BASELINE_UPDATE_BAND)
-        bx = (1.0f - BASELINE_ALPHA) * bx + BASELINE_ALPHA * ax;
-    if (fabsf(dry) < BASELINE_UPDATE_BAND)
-        by = (1.0f - BASELINE_ALPHA) * by + BASELINE_ALPHA * ay;
-
-    update_axis(roll,  drx, "ROLL");
-    update_axis(pitch, dry, "PITCH");
+    update_axis(roll,  roll_rel,  "ROLL");
+    update_axis(pitch, pitch_rel, "PITCH");
 }
 
 bool imu_consume_tilt_left(void) {
