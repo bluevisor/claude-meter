@@ -398,30 +398,127 @@ async def poll_api_billing(cfg: dict) -> dict | None:
     return payload
 
 
+def _project_dir_from_cwd(cwd: str) -> str:
+    """Map a filesystem path to Claude Code's project-dir naming
+    convention: `/Users/x/y/.claude/z` → `-Users-x-y--claude-z`.
+    Both `/` and `.` are replaced with `-`."""
+    return cwd.replace("/", "-").replace(".", "-")
+
+
+# Per-process info captured by _enumerate_running_sessions. Keyed by
+# JSONL path so the rest of the daemon (which talks in paths) doesn't
+# need to know about PIDs.
+_proc_info_by_jsonl: dict[Path, dict] = {}
+
+
+def _enumerate_running_sessions() -> list[Path]:
+    """The source of truth: every running `claude` process is one
+    session. Returns the JSONL path for each, sorted by mtime newest-
+    first. Side-effect: refreshes `_proc_info_by_jsonl` with each
+    process' base_url, cwd, and pid.
+
+    Agent-mode invocations (no controlling TTY, run by Claude Code's
+    auto-mode) are excluded — they're ephemeral subprocesses of the
+    user's interactive sessions, not their own session.
+    """
+    import subprocess
+
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-x", "claude"],
+            capture_output=True, text=True, timeout=2.0,
+        ).stdout.split()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    fresh: dict[Path, dict] = {}
+    candidates: list[tuple[float, Path]] = []
+    for pid in pids:
+        try:
+            tty = subprocess.run(
+                ["ps", "-p", pid, "-o", "tty="],
+                capture_output=True, text=True, timeout=1.0,
+            ).stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        # ?? = no controlling terminal → agent / headless.
+        if not tty or tty.startswith("?"):
+            continue
+
+        try:
+            lsof_out = subprocess.run(
+                ["/usr/sbin/lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=1.0,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        cwd = ""
+        for line in lsof_out.splitlines():
+            if line.startswith("n"):
+                cwd = line[1:].strip()
+                break
+        if not cwd:
+            continue
+
+        try:
+            env_line = subprocess.run(
+                ["ps", "-E", "-p", pid, "-ww", "-o", "command="],
+                capture_output=True, text=True, timeout=1.0,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        base_url = ""
+        for tok in env_line.split():
+            if tok.startswith("ANTHROPIC_BASE_URL="):
+                base_url = tok[len("ANTHROPIC_BASE_URL="):]
+                break
+
+        project_dir = CLAUDE_PROJECTS_DIR / _project_dir_from_cwd(cwd)
+        if not project_dir.is_dir():
+            continue
+        # Pick the most-recent JSONL in this proc's project dir that
+        # hasn't already been claimed by another running proc in the
+        # same dir. With two `claude` instances in the same cwd we
+        # pair them with the two newest transcripts; otherwise both
+        # would map to the same file and the overview would show a
+        # duplicate row.
+        jsonls = []
+        for jsonl in project_dir.glob("*.jsonl"):
+            try:
+                m = jsonl.stat().st_mtime
+            except OSError:
+                continue
+            jsonls.append((m, jsonl))
+        jsonls.sort(key=lambda t: t[0], reverse=True)
+        chosen: Path | None = None
+        chosen_mtime = 0.0
+        for m, j in jsonls:
+            if j not in fresh:
+                chosen = j
+                chosen_mtime = m
+                break
+        if chosen is None:
+            continue
+
+        fresh[chosen] = {
+            "pid":      int(pid),
+            "cwd":      cwd,
+            "base_url": base_url,
+        }
+        candidates.append((chosen_mtime, chosen))
+
+    _proc_info_by_jsonl.clear()
+    _proc_info_by_jsonl.update(fresh)
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in candidates]
+
+
 def find_active_session() -> Path | None:
-    """Return the most-recently-touched fresh JSONL, or None."""
     sessions = find_active_sessions()
     return sessions[0] if sessions else None
 
 
 def find_active_sessions() -> list[Path]:
-    """Return all fresh JSONL transcripts, newest first."""
-    if not CLAUDE_PROJECTS_DIR.exists():
-        return []
-    cutoff = time.time() - SESSION_FRESH_SECONDS
-    candidates: list[tuple[float, Path]] = []
-    for proj in CLAUDE_PROJECTS_DIR.iterdir():
-        if not proj.is_dir():
-            continue
-        for f in proj.glob("*.jsonl"):
-            try:
-                mtime = f.stat().st_mtime
-            except OSError:
-                continue
-            if mtime >= cutoff:
-                candidates.append((mtime, f))
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    return [p for _, p in candidates]
+    return _enumerate_running_sessions()
 
 
 def _parse_iso_timestamp(ts: str) -> float | None:
@@ -850,19 +947,17 @@ async def read_session_payload() -> dict | None:
             "tt":  s_sum["task_tokens"],
         })
 
-    # Determine API vs subscription, in priority order:
-    #   1. JSONL `baseUrl` field (currently null in Claude Code 2.1.x,
-    #      will become the source of truth once it's populated).
-    #   2. ANTHROPIC_BASE_URL of the running claude process whose cwd
-    #      matches this session.
-    # If both signals are unavailable, leave base_url as None and let
-    # _session_mode_for_base_url default to subscription — better to
-    # show stale-looking subscription numbers than to guess a mode
-    # from the model name (which is a misleading signal: Opus can
-    # run on LiteLLM, Sonnet/Haiku can run on Max).
+    # Determine API vs subscription via, in priority order:
+    #   1. JSONL `baseUrl` field (Claude Code populates it for some
+    #      versions; source of truth when present).
+    #   2. ANTHROPIC_BASE_URL of the *running* `claude` process that
+    #      owns this session (looked up from the same enumeration that
+    #      produced the session list).
     base_url = summary.get("base_url")
     if not base_url:
-        base_url = _base_url_for_cwd(summary.get("cwd"))
+        info = _proc_info_by_jsonl.get(focus)
+        if info is not None:
+            base_url = info.get("base_url", "")
 
     return {
         # Stash base_url at the top level so poll_usage() can read it
@@ -899,79 +994,6 @@ def _session_mode_for_base_url(base_url: str | None) -> str:
     if "anthropic.com" in base_url.lower():
         return "subscription"
     return "api"
-
-
-# ---- Per-session ANTHROPIC_BASE_URL discovery via /bin/ps -E ----
-# Claude Code 2.1.x doesn't (yet) record the baseUrl field on JSONL
-# records, so we read it straight out of each running `claude` process's
-# environment. macOS `ps -E` exposes the env for our own user's procs;
-# we map each PID's PWD to the running session's cwd and use that as
-# the key.
-_proc_env_cache: dict[str, tuple[str, float]] = {}     # cwd -> (base_url, ts)
-_PROC_ENV_TTL = 3.0                                    # seconds
-
-
-def _refresh_proc_env_cache() -> None:
-    """Walk every running `claude` process, read its env (ps -E) and
-    real-time cwd (lsof), and update the cwd → base_url cache.
-
-    `PWD` in the env can be stale if the user cd'd inside the session;
-    lsof's `cwd` is the kernel's view of the current directory and is
-    always fresh.
-    """
-    import subprocess
-    try:
-        pids = subprocess.run(
-            ["pgrep", "-x", "claude"],
-            capture_output=True, text=True, timeout=2.0,
-        ).stdout.split()
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return
-    now = time.time()
-    _proc_env_cache.clear()
-    for pid in pids:
-        try:
-            env_line = subprocess.run(
-                ["ps", "-E", "-p", pid, "-ww", "-o", "command="],
-                capture_output=True, text=True, timeout=1.0,
-            ).stdout
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-        base_url = ""
-        for tok in env_line.split():
-            if tok.startswith("ANTHROPIC_BASE_URL="):
-                base_url = tok[len("ANTHROPIC_BASE_URL="):]
-                break
-        try:
-            # -a ANDs -p and -d; without it lsof OR's them and returns
-            # every fd from every process. -F outputs machine-parsable
-            # lines: `p<pid>`, `n<name>`, etc.
-            lsof_out = subprocess.run(
-                ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
-                capture_output=True, text=True, timeout=1.0,
-            ).stdout
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-        cwd = ""
-        for line in lsof_out.splitlines():
-            if line.startswith("n"):
-                cwd = line[1:].strip()
-                break
-        if cwd:
-            _proc_env_cache[cwd] = (base_url, now)
-
-
-def _base_url_for_cwd(cwd: str | None) -> str | None:
-    """Return the ANTHROPIC_BASE_URL of the running claude process whose
-    PWD matches `cwd`, refreshing the cache if it's stale."""
-    if not cwd:
-        return None
-    now = time.time()
-    cached = _proc_env_cache.get(cwd)
-    if cached is None or (now - cached[1]) > _PROC_ENV_TTL:
-        _refresh_proc_env_cache()
-        cached = _proc_env_cache.get(cwd)
-    return cached[0] if cached else None
 
 
 async def poll_usage() -> dict | None:
