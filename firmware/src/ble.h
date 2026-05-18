@@ -19,3 +19,7 @@ const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
+
+// Send a 1-byte control packet over the REQ characteristic.
+//   0x01 = plain refresh; 0x02 = next session; 0x03 = previous session.
+void ble_send_control(uint8_t code);

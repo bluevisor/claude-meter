@@ -54,11 +54,27 @@ static lv_obj_t  *anim_ctx_label, *anim_ctx_value, *anim_ctx_bar_bg, *anim_ctx_b
 static lv_obj_t  *anim_bulb        = nullptr;   // small yellow circle for the lightbulb beat
 static lv_obj_t  *anim_thought_dot = nullptr;   // little muted dot for the thinking beat
 
+// ────────────────────── Overview screen widgets ──────────────────────
+#define OVERVIEW_MAX_ROWS 6
+static lv_obj_t  *ov_container = nullptr;
+static lv_obj_t  *ov_title     = nullptr;
+static lv_obj_t  *ov_hint      = nullptr;
+static lv_obj_t  *ov_rows[OVERVIEW_MAX_ROWS] = {};
+static lv_obj_t  *ov_row_label[OVERVIEW_MAX_ROWS] = {};
+static lv_obj_t  *ov_row_pct[OVERVIEW_MAX_ROWS] = {};
+static lv_obj_t  *ov_row_bar[OVERVIEW_MAX_ROWS] = {};
+static lv_obj_t  *ov_row_dot[OVERVIEW_MAX_ROWS] = {};
+
 static screen_t  current_screen = SCREEN_USAGE;
 static UsageMode displayed_mode = MODE_UNKNOWN;
 
 enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB };
 static work_phase_t cur_phase = PHASE_WORKING;
+static uint16_t     anim_seq_idx = 0;     // reset to 0 on phase change
+
+// Forward decl: definition lives further down with ui_update, but the
+// overview renderer needs to color its mini bars too.
+static lv_color_t context_color_for(int pct);
 
 // Walk-cycle + progress-bar synthetic animation state
 static uint8_t   walk_frame    = 1;          // alternates 1↔2 (walkA, walkB)
@@ -76,6 +92,13 @@ static uint32_t  task_seconds_at_sync = 0;
 static uint32_t  task_sync_tick_ms    = 0;
 static bool      task_active_latched  = false;
 
+// 8-frame "braille" spinner approximated with ASCII chars Montserrat
+// ships with. Reads as a small rotating two-dot indicator.
+static const char* const SPIN_FRAMES[] = {
+    ":  ", ". .", " ..", "  :", ".  ", ":  ", " : ", ":. ",
+};
+#define SPIN_FRAME_COUNT 8
+
 static void render_working_line(void) {
     uint32_t s = task_seconds_at_sync;
     if (task_active_latched) {
@@ -87,12 +110,10 @@ static void render_working_line(void) {
     char buf[32];
     char tok[16];
     // Spinner: while a turn is mid-flight but no output tokens have
-    // landed yet, show a rotating ASCII glyph instead of "0".
+    // landed yet, show a rotating dot pattern instead of "0".
     if (task_active_latched && task_tokens_latched == 0) {
-        static const char* SPIN_FRAMES = "|/-\\";
-        uint32_t spin_idx = (lv_tick_get() / 120) & 3;
-        tok[0] = SPIN_FRAMES[spin_idx];
-        tok[1] = '\0';
+        uint32_t spin_idx = (lv_tick_get() / 110) % SPIN_FRAME_COUNT;
+        snprintf(tok, sizeof(tok), "%s", SPIN_FRAMES[spin_idx]);
     } else if (task_tokens_latched < 1000) {
         snprintf(tok, sizeof(tok), "%u",     (unsigned)task_tokens_latched);
     } else if (task_tokens_latched < 100000) {
@@ -378,6 +399,77 @@ static void init_animation_screen(lv_obj_t* parent) {
     lv_obj_set_style_bg_opa(anim_ctx_bar_fill, LV_OPA_COVER, 0);
 }
 
+// ────────────────────── Overview screen ──────────────────────
+
+static void init_overview_screen(lv_obj_t* parent) {
+    ov_container = make_container(parent);
+
+    ov_title = make_label(ov_container, &lv_font_montserrat_24, THEME_TEXT, "Sessions");
+    lv_obj_set_pos(ov_title, MARGIN, 4);
+
+    ov_hint = make_label(ov_container, &lv_font_montserrat_12, THEME_TEXT_MUTED, "shake to switch");
+    lv_obj_align(ov_hint, LV_ALIGN_TOP_RIGHT, -MARGIN, 12);
+
+    int row_h = 30;
+    int y0    = 38;
+    int row_w = SCR_W - 2 * MARGIN;
+    for (int i = 0; i < OVERVIEW_MAX_ROWS; i++) {
+        int y = y0 + i * row_h;
+        ov_rows[i] = make_pane(ov_container, MARGIN, y, row_w, row_h - 2);
+
+        ov_row_dot[i] = lv_obj_create(ov_rows[i]);
+        lv_obj_remove_style_all(ov_row_dot[i]);
+        lv_obj_set_size(ov_row_dot[i], 8, 8);
+        lv_obj_set_style_radius(ov_row_dot[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(ov_row_dot[i], THEME_ACCENT, 0);
+        lv_obj_set_style_bg_opa(ov_row_dot[i], LV_OPA_COVER, 0);
+        lv_obj_align(ov_row_dot[i], LV_ALIGN_LEFT_MID, 0, -6);
+
+        ov_row_label[i] = make_label(ov_rows[i], &lv_font_montserrat_14, THEME_TEXT, "—");
+        lv_obj_align(ov_row_label[i], LV_ALIGN_LEFT_MID, 14, -6);
+
+        ov_row_pct[i] = make_label(ov_rows[i], &lv_font_montserrat_14, THEME_TEXT_MUTED, "");
+        lv_obj_align(ov_row_pct[i], LV_ALIGN_RIGHT_MID, 0, -6);
+
+        ov_row_bar[i] = make_pane(ov_rows[i], 0, row_h - 8, row_w, 3);
+        lv_obj_set_style_bg_color(ov_row_bar[i], THEME_BAR_BG, 0);
+        lv_obj_set_style_bg_opa(ov_row_bar[i], LV_OPA_COVER, 0);
+
+        lv_obj_add_flag(ov_rows[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void render_overview(const UsageData* data) {
+    if (!ov_container) return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Sessions (%u)", (unsigned)data->session_count);
+    lv_label_set_text(ov_title, buf);
+    for (int i = 0; i < OVERVIEW_MAX_ROWS; i++) {
+        if (i >= data->sessions_listed) {
+            lv_obj_add_flag(ov_rows[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(ov_rows[i], LV_OBJ_FLAG_HIDDEN);
+        const auto& s = data->sessions[i];
+        lv_label_set_text(ov_row_label[i], s.model_label[0] ? s.model_label : "—");
+        snprintf(buf, sizeof(buf), "%u%%", (unsigned)s.ctx_pct);
+        lv_label_set_text(ov_row_pct[i], buf);
+        // Dot: green while active, muted when idle. Focused session
+        // dot uses the brand accent so you can see which one a switch
+        // would change.
+        lv_color_t dot_c = (i == data->session_index) ? THEME_ACCENT
+                          : s.active                  ? lv_color_hex(0x00B070)
+                                                       : THEME_TEXT_VDIM;
+        lv_obj_set_style_bg_color(ov_row_dot[i], dot_c, 0);
+        // Mini context bar fill
+        int avail = SCR_W - 2 * MARGIN;
+        int w = avail * s.ctx_pct / 100;
+        if (w < 0) w = 0; if (w > avail) w = avail;
+        lv_obj_set_size(ov_row_bar[i], w, 3);
+        lv_obj_set_style_bg_color(ov_row_bar[i], context_color_for(s.ctx_pct), 0);
+    }
+}
+
 // ────────────────────── Public API ──────────────────────
 
 void ui_init(void) {
@@ -390,9 +482,11 @@ void ui_init(void) {
     init_subscription_screen(scr);
     init_api_screen(scr);
     init_animation_screen(scr);
+    init_overview_screen(scr);
 
     lv_obj_add_flag(api_container,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ov_container,   LV_OBJ_FLAG_HIDDEN);
 }
 
 static void apply_mode_visibility(void) {
@@ -441,6 +535,10 @@ void ui_update(const UsageData* data) {
     lv_label_set_text(api_tag, "API");
     lv_obj_clear_flag(sub_tag, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(api_tag, LV_OBJ_FLAG_HIDDEN);
+
+    // Overview is independent of the working/idle flip; always refresh
+    // it so when the user shakes to it the rows are current.
+    render_overview(data);
 
     if (data->mode == MODE_API) {
         int pct = 0;
@@ -546,7 +644,8 @@ void ui_update(const UsageData* data) {
     if (strcmp(data->phase, "lightbulb") == 0) new_phase = PHASE_LIGHTBULB;
     if (new_phase != cur_phase) {
         cur_phase = new_phase;
-        walk_last_ms = 0;  // re-arm so the new sequence starts immediately
+        walk_last_ms = 0;     // re-arm so the new sequence starts immediately
+        anim_seq_idx = 0;     // start at sequence frame 0 for the new phase
     }
     if (anim_bulb) {
         if (cur_phase == PHASE_LIGHTBULB) lv_obj_clear_flag(anim_bulb, LV_OBJ_FLAG_HIDDEN);
@@ -592,10 +691,12 @@ static const uint8_t ANIM_THINKING[] = {
     7, 7, 3, 3, 4, 4, 5, 5,
     7, 3, 0, 7, 3, 2,
 };
-// "Lightbulb" cycle — the figure is replaced by a yellow bulb sprite
-// that twinkles for a few beats. Frames 8 (plain) / 9 (with shine).
+// "Lightbulb" cycle — the figure is replaced by a yellow bulb (frame
+// 8, outline only), holds for a beat, then flashes once with rays
+// (frame 9), then holds again. The sequence index is reset on phase
+// entry so the flash always reads as a single discrete event.
 static const uint8_t ANIM_LIGHTBULB[] = {
-    8, 9, 8, 9, 8, 9, 8, 9,
+    8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 };
 
 struct anim_phase_def_t {
@@ -633,15 +734,14 @@ void ui_tick_anim(void) {
 
     if (now - walk_last_ms >= def.interval_ms) {
         walk_last_ms = now;
-        static uint16_t seq_idx = 0;
         static uint16_t bob_idx = 0;
         static uint16_t sway_idx = 0;
         // Wrap inside the active phase's sequence length so a phase
         // swap doesn't index past the end of a shorter array.
-        seq_idx  = (seq_idx + 1)  % def.len;
-        bob_idx  = (bob_idx + 1)  % BOB_LEN;
-        sway_idx = (sway_idx + 1) % SWAY_LEN;
-        lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[seq_idx]));
+        anim_seq_idx = (anim_seq_idx + 1) % def.len;
+        bob_idx      = (bob_idx + 1)      % BOB_LEN;
+        sway_idx     = (sway_idx + 1)     % SWAY_LEN;
+        lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[anim_seq_idx]));
         // Lightbulb makes the figure hop a touch higher; thinking holds
         // it still (no bob/sway) so it reads as concentrating.
         int sway = SWAY_OFFSETS[sway_idx];
@@ -659,6 +759,7 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(sub_container,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(api_container,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
+    if (ov_container) lv_obj_add_flag(ov_container, LV_OBJ_FLAG_HIDDEN);
 
     switch (screen) {
     case SCREEN_USAGE:
@@ -667,6 +768,9 @@ void ui_show_screen(screen_t screen) {
         break;
     case SCREEN_SPLASH:
         lv_obj_clear_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case SCREEN_OVERVIEW:
+        if (ov_container) lv_obj_clear_flag(ov_container, LV_OBJ_FLAG_HIDDEN);
         break;
     case SCREEN_BLUETOOTH:
         // Status screen retired in the redesign — fall through to usage.
@@ -691,6 +795,25 @@ void ui_toggle_splash(void) {
 }
 
 screen_t ui_get_current_screen(void) { return current_screen; }
+
+void ui_handle_shake(void) {
+    // On the overview screen a double-shake advances the focused
+    // session — the daemon hears the 0x02 control byte and starts
+    // pushing that session's data. Anywhere else a double-shake
+    // cycles screens (usage → overview → splash → usage).
+    if (current_screen == SCREEN_OVERVIEW) {
+        ble_send_control(0x02);
+        return;
+    }
+    screen_t next;
+    switch (current_screen) {
+        case SCREEN_USAGE:    next = SCREEN_OVERVIEW; break;
+        case SCREEN_OVERVIEW: next = SCREEN_SPLASH;   break;
+        case SCREEN_SPLASH:   next = SCREEN_USAGE;    break;
+        default:              next = SCREEN_USAGE;    break;
+    }
+    ui_show_screen(next);
+}
 
 // BLE status used to drive the (now-retired) Status screen. Keep the symbol
 // alive so main.cpp still links; ignore the parameters.

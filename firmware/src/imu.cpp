@@ -1,49 +1,39 @@
 #include "imu.h"
 #include "display_cfg.h"
 #include <Arduino.h>
+#include <math.h>
 
-// Poll and hysteresis timing
-#define IMU_POLL_MS       100    // read accel at ~10 Hz
-#define STABLE_TIME_MS    300    // orientation must be stable this long before rotating
-#define TILT_THRESHOLD    0.5f   // ~30 degrees from axis (sin(30) ~ 0.5)
+// Sample the accelerometer ~50 Hz and look for "shake" spikes. A single
+// shake = magnitude jumps above SHAKE_HI then settles below SHAKE_LO.
+// A double-shake = two such spikes within DOUBLE_WIN. The latch is
+// consumed by imu_consume_double_shake().
 
-static uint8_t  current_rotation = 0;
-static uint8_t  candidate_rotation = 0;
-static uint32_t candidate_since = 0;
-static uint32_t last_poll_ms = 0;
-static bool     imu_ok = false;
+#define IMU_POLL_MS        20      // 50 Hz
+#define SHAKE_HI           1.45f   // |a| > 1.45 g triggers a spike
+#define SHAKE_LO           1.10f   // need to drop below this between spikes
+#define SPIKE_COOLDOWN_MS  120     // ignore further hi crossings for this long
+#define DOUBLE_WIN_MIN_MS  200
+#define DOUBLE_WIN_MAX_MS  900
 
-// Determine target rotation from accelerometer gravity vector.
-// Returns 0-3 or 255 if ambiguous (e.g. face-up/face-down).
-static uint8_t accel_to_rotation(float ax, float ay) {
-    float abs_ax = fabsf(ax);
-    float abs_ay = fabsf(ay);
-
-    if (abs_ax < TILT_THRESHOLD && abs_ay < TILT_THRESHOLD) {
-        return 255;  // ambiguous, keep current
-    }
-
-    if (abs_ay > abs_ax) {
-        return (ay > 0) ? 3 : 1;
-    } else {
-        return (ax > 0) ? 0 : 2;
-    }
-}
+static bool      imu_ok = false;
+static uint32_t  last_poll_ms = 0;
+static bool      armed = true;             // ready for next hi-crossing
+static uint32_t  last_spike_ms = 0;
+static uint32_t  prev_spike_ms = 0;
+static bool      double_shake_latched = false;
 
 void imu_init(void) {
     if (!imu.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
         Serial.println("QMI8658 init failed");
         return;
     }
-    Serial.println("QMI8658 init OK");
-
     imu.configAccelerometer(
         SensorQMI8658::ACC_RANGE_4G,
         SensorQMI8658::ACC_ODR_LOWPOWER_21Hz,
         SensorQMI8658::LPF_MODE_3);
     imu.enableAccelerometer();
-
     imu_ok = true;
+    Serial.println("QMI8658 init OK (shake detector)");
 }
 
 void imu_tick(void) {
@@ -56,21 +46,28 @@ void imu_tick(void) {
     float ax, ay, az;
     if (!imu.getAccelerometer(ax, ay, az)) return;
 
-    uint8_t target = accel_to_rotation(ax, ay);
-    if (target == 255 || target == current_rotation) {
-        candidate_rotation = current_rotation;
-        return;
-    }
+    float mag = sqrtf(ax * ax + ay * ay + az * az);
 
-    if (target != candidate_rotation) {
-        candidate_rotation = target;
-        candidate_since = now;
-    } else if (now - candidate_since >= STABLE_TIME_MS) {
-        current_rotation = target;
-        Serial.printf("Rotation: %d\n", current_rotation);
+    if (armed && mag > SHAKE_HI && (now - last_spike_ms) > SPIKE_COOLDOWN_MS) {
+        // Spike. Check whether it pairs with the prior one within the
+        // double-shake window before recording.
+        uint32_t gap = (last_spike_ms != 0) ? (now - last_spike_ms) : UINT32_MAX;
+        prev_spike_ms = last_spike_ms;
+        last_spike_ms = now;
+        armed = false;
+        if (gap >= DOUBLE_WIN_MIN_MS && gap <= DOUBLE_WIN_MAX_MS) {
+            double_shake_latched = true;
+            // Consume both spikes so a triple-shake doesn't double-fire.
+            prev_spike_ms = 0;
+            last_spike_ms = 0;
+        }
+    } else if (!armed && mag < SHAKE_LO) {
+        armed = true;
     }
 }
 
-uint8_t imu_get_rotation(void) {
-    return current_rotation;
+bool imu_consume_double_shake(void) {
+    if (!double_shake_latched) return false;
+    double_shake_latched = false;
+    return true;
 }

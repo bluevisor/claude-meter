@@ -177,11 +177,14 @@ void ble_send_nack(void) {
 }
 
 void ble_request_refresh(void) {
+    ble_send_control(0x01);
+}
+
+void ble_send_control(uint8_t code) {
     if (state == BLE_STATE_CONNECTED && req_char) {
-        uint8_t v = 0x01;
-        req_char->setValue(&v, 1);
+        req_char->setValue(&code, 1);
         req_char->notify();
-        Serial.println("BLE: refresh requested");
+        Serial.printf("BLE: sent control 0x%02X\n", code);
     }
 }
 

@@ -35,6 +35,19 @@ struct UsageData {
     char     model_label[24];   // e.g. "Opus 4.7 1M" (empty if unknown)
     char     phase[12];         // "thinking" / "lightbulb" / "working"
 
+    // Multi-session — when more than one Claude Code instance is alive
+    // the daemon also ships a per-session summary list. session_count is
+    // the total active, session_index is which one this payload focuses.
+    uint8_t  session_count;
+    uint8_t  session_index;
+    struct {
+        char     model_label[24];
+        uint8_t  ctx_pct;        // 0..100
+        bool     active;
+        uint32_t task_tokens;
+    } sessions[6];               // cap at 6 — keeps the payload BLE-sized
+    uint8_t  sessions_listed;    // how many slots in `sessions` are valid
+
     char status[16];
     bool ok;
     bool valid;

@@ -8,6 +8,7 @@
 #include "ble.h"
 #include "power.h"
 #include "wifi_cfg.h"
+#include "imu.h"
 
 // ---- Hardware objects ----
 // Arduino_GFX provides setRotation() for ST7789 via MADCTL, so we don't
@@ -102,6 +103,20 @@ static bool parse_usage_json(const char* json, UsageData* out) {
     out->task_seconds = (uint32_t)(doc["ts"] | (uint32_t)0);
     strlcpy(out->model_label, doc["ml"] | "", sizeof(out->model_label));
     strlcpy(out->phase, doc["ph"] | "working", sizeof(out->phase));
+    out->session_count = (uint8_t)(doc["sn"] | 1);
+    out->session_index = (uint8_t)(doc["si"] | 0);
+    out->sessions_listed = 0;
+    JsonArrayConst sl = doc["sl"].as<JsonArrayConst>();
+    if (!sl.isNull()) {
+        for (JsonObjectConst row : sl) {
+            if (out->sessions_listed >= 6) break;
+            auto& dst = out->sessions[out->sessions_listed++];
+            strlcpy(dst.model_label, row["ml"] | "", sizeof(dst.model_label));
+            dst.ctx_pct     = (uint8_t)(row["cp"] | 0);
+            dst.active      = ((int)(row["ac"] | 0)) != 0;
+            dst.task_tokens = (uint32_t)(row["tt"] | (uint32_t)0);
+        }
+    }
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
     out->valid = true;
@@ -185,6 +200,9 @@ void setup(void) {
     // BLE peripheral (daemon link)
     ble_init();
 
+    // IMU — used here for shake-to-cycle / shake-to-switch gestures.
+    imu_init();
+
     // WiFi — connect with hardcoded creds (see secrets.h.example) and then
     // sit idle. Not used for data on this build; provisioned for future use
     // and so the radio is up for NTP / OTA if you want them later.
@@ -206,6 +224,8 @@ void loop(void) {
     lv_timer_handler();
     ui_tick_anim();
     ble_tick();
+    imu_tick();
+    if (imu_consume_double_shake()) ui_handle_shake();
 
     ble_state_t bs = ble_get_state();
     if (bs != last_ble_state) {

@@ -5,9 +5,14 @@
 enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
+    SCREEN_OVERVIEW,
     SCREEN_BLUETOOTH,
     SCREEN_COUNT,
 };
+
+// Routed from main.cpp on a double-shake gesture: cycles screens, or on
+// the overview screen advances the focused session via BLE.
+void ui_handle_shake(void);
 
 void ui_init(void);
 void ui_update(const UsageData* data);

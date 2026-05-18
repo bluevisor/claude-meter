@@ -358,10 +358,17 @@ async def poll_api_billing(cfg: dict) -> dict | None:
 
 
 def find_active_session() -> Path | None:
-    """Return the most-recently-touched JSONL transcript, if any is fresh."""
+    """Return the most-recently-touched fresh JSONL, or None."""
+    sessions = find_active_sessions()
+    return sessions[0] if sessions else None
+
+
+def find_active_sessions() -> list[Path]:
+    """Return all fresh JSONL transcripts, newest first."""
     if not CLAUDE_PROJECTS_DIR.exists():
-        return None
-    newest: tuple[float, Path] | None = None
+        return []
+    cutoff = time.time() - SESSION_FRESH_SECONDS
+    candidates: list[tuple[float, Path]] = []
     for proj in CLAUDE_PROJECTS_DIR.iterdir():
         if not proj.is_dir():
             continue
@@ -370,14 +377,10 @@ def find_active_session() -> Path | None:
                 mtime = f.stat().st_mtime
             except OSError:
                 continue
-            if newest is None or mtime > newest[0]:
-                newest = (mtime, f)
-    if newest is None:
-        return None
-    age = time.time() - newest[0]
-    if age > SESSION_FRESH_SECONDS:
-        return None
-    return newest[1]
+            if mtime >= cutoff:
+                candidates.append((mtime, f))
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in candidates]
 
 
 def _parse_iso_timestamp(ts: str) -> float | None:
@@ -613,22 +616,60 @@ def _model_display_label(transcript_model: str, settings_model: str, ctx_max: in
     return name.strip() or "Claude"
 
 
+# Index of the currently-selected session within find_active_sessions().
+# Mutated by the BLE refresh char (shake-to-switch from the device).
+_selected_session_idx = 0
+
+
+def cycle_selected_session(direction: int = 1) -> int:
+    """Advance the focus session by +/-1 and return the new index."""
+    global _selected_session_idx
+    n = max(1, len(find_active_sessions()))
+    _selected_session_idx = (_selected_session_idx + direction) % n
+    return _selected_session_idx
+
+
 async def read_session_payload() -> dict | None:
-    """Pull ctx_used/ctx_max + active flag from the latest JSONL."""
-    active = find_active_session()
-    if active is None:
+    """Build the per-session + multi-session payload."""
+    sessions = find_active_sessions()
+    if not sessions:
         return None
-    summary = read_session_usage(active)
+    global _selected_session_idx
+    if _selected_session_idx >= len(sessions):
+        _selected_session_idx = 0
+    focus = sessions[_selected_session_idx]
+    summary = read_session_usage(focus)
     if summary is None:
         return None
     try:
-        mtime = active.stat().st_mtime
+        mtime = focus.stat().st_mtime
     except OSError:
         mtime = 0.0
     is_active = (time.time() - mtime) < SESSION_ACTIVE_SECONDS
-    label = _model_display_label(
-        summary.get("model", ""), _settings_model() or "", summary["ctx_max"]
-    )
+    settings_model = _settings_model() or ""
+    label = _model_display_label(summary.get("model", ""), settings_model, summary["ctx_max"])
+
+    # Compact summary for every active session — drives the overview UI.
+    overview: list[dict] = []
+    for s_path in sessions:
+        s_sum = read_session_usage(s_path)
+        if s_sum is None:
+            continue
+        try:
+            s_mtime = s_path.stat().st_mtime
+        except OSError:
+            s_mtime = 0.0
+        s_label = _model_display_label(s_sum.get("model", ""), settings_model, s_sum["ctx_max"])
+        s_pct = 0
+        if s_sum["ctx_max"]:
+            s_pct = int(min(100.0, s_sum["ctx_used"] * 100.0 / s_sum["ctx_max"]) + 0.5)
+        overview.append({
+            "ml":  s_label,
+            "cp":  s_pct,
+            "ac":  1 if (time.time() - s_mtime) < SESSION_ACTIVE_SECONDS else 0,
+            "tt":  s_sum["task_tokens"],
+        })
+
     return {
         "cu": summary["ctx_used"],
         "cm": summary["ctx_max"],
@@ -643,6 +684,12 @@ async def read_session_payload() -> dict | None:
         "ml":  label,
         # Current phase — drives which working animation to play.
         "ph":  summary["phase"],
+        # Multi-session: total count + the currently focused index.
+        "sn":  len(sessions),
+        "si":  _selected_session_idx,
+        # Overview rows (kept short so the whole payload fits in one
+        # BLE write; the firmware uses this for the overview screen).
+        "sl":  overview,
     }
 
 
@@ -696,8 +743,19 @@ class Session:
         self.client = client
         self.refresh_requested = asyncio.Event()
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
+    def _on_refresh(self, _char, data: bytearray) -> None:
+        # Single-byte protocol: 0x01 = plain refresh request;
+        # 0x02 = "next session" (device-side shake-to-switch);
+        # 0x03 = "previous session". Anything else falls back to refresh.
+        b = data[0] if data else 0x01
+        if b == 0x02:
+            new_idx = cycle_selected_session(+1)
+            log(f"Device requested next session (now idx={new_idx})")
+        elif b == 0x03:
+            new_idx = cycle_selected_session(-1)
+            log(f"Device requested previous session (now idx={new_idx})")
+        else:
+            log("Refresh requested by device")
         self.refresh_requested.set()
 
     async def setup_refresh_subscription(self) -> None:
