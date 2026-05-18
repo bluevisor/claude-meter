@@ -21,3 +21,4 @@ daemon/.venv/
 # Python bytecode cache
 __pycache__/
 *.pyc
+/firmware/src/seen_logo_frames.h
