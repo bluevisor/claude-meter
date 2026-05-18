@@ -423,13 +423,28 @@ def _enumerate_running_sessions() -> list[Path]:
     """
     import subprocess
 
+    # `ps -axo pid,comm` instead of `pgrep -x claude`. macOS pgrep
+    # matches against the BSD accounting name, which Claude CLI
+    # overwrites with its version string ("2.1.143") via setproctitle
+    # shortly after exec — so pgrep races against the rename and
+    # silently misses some sessions while still returning others.
+    # ps reads `p_comm` (the kernel-level basename of argv[0]), which
+    # is stable, so every claude PID shows up reliably here.
     try:
-        pids = subprocess.run(
-            ["pgrep", "-x", "claude"],
+        ps_out = subprocess.run(
+            ["ps", "-axo", "pid=,comm="],
             capture_output=True, text=True, timeout=2.0,
-        ).stdout.split()
+        ).stdout
     except (subprocess.SubprocessError, FileNotFoundError):
         return []
+    pids: list[str] = []
+    for line in ps_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, comm = line.partition(" ")
+        if comm.strip().rsplit("/", 1)[-1] == "claude":
+            pids.append(pid_str)
     fresh: dict[Path, dict] = {}
     candidates: list[tuple[float, Path]] = []
     for pid in pids:
