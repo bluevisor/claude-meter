@@ -1,563 +1,703 @@
 #include "ui.h"
-#include "splash.h"
-#include <lvgl.h>
-#include "logo.h"
-#include "icons.h"
-#include "display_cfg.h"
-
-// Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
-LV_FONT_DECLARE(font_tiempos_56);
-LV_FONT_DECLARE(font_styrene_48);
-LV_FONT_DECLARE(font_styrene_28);
-LV_FONT_DECLARE(font_styrene_24);
-LV_FONT_DECLARE(font_styrene_20);
-LV_FONT_DECLARE(font_mono_32);
-
-// Anthropic brand palette — design tokens live in theme.h
+#include "clawd_sprite.h"
 #include "theme.h"
-#define COL_BG        THEME_BG
-#define COL_PANEL     THEME_PANEL
-#define COL_TEXT      THEME_TEXT
-#define COL_DIM       THEME_DIM
-#define COL_ACCENT    THEME_ACCENT
-#define COL_GREEN     THEME_GREEN
-#define COL_AMBER     THEME_AMBER
-#define COL_RED       THEME_RED
-#define COL_BAR_BG    THEME_BAR_BG
+#include "display_cfg.h"
+#include <lvgl.h>
 
-// ---- Layout constants for 480x480 (scaled for 2.16" high-DPI + rounded corners) ----
-#define SCR_W         480
-#define SCR_H         480
-#define MARGIN        20    // wider margin for rounded display corners
-#define TITLE_Y       30
-#define CONTENT_Y     100
-#define CONTENT_W     (SCR_W - 2 * MARGIN)   // 440
+// LVGL built-in Montserrat (enabled via -DLV_FONT_MONTSERRAT_*=1).
+// The Claude Design handoff specifies DM Sans + JetBrains Mono — we
+// substitute Montserrat across the board. Sizes are mapped to the
+// closest available LVGL preset.
+LV_FONT_DECLARE(lv_font_montserrat_12);
+LV_FONT_DECLARE(lv_font_montserrat_14);
+LV_FONT_DECLARE(lv_font_montserrat_18);
+LV_FONT_DECLARE(lv_font_montserrat_24);
+LV_FONT_DECLARE(lv_font_montserrat_28);
+LV_FONT_DECLARE(lv_font_montserrat_36);
+LV_FONT_DECLARE(lv_font_montserrat_48);
 
-// ---- Usage screen widgets ----
-static lv_obj_t* usage_container;
-static lv_obj_t* lbl_title;
-static lv_obj_t* bar_session;
-static lv_obj_t* lbl_session_pct;
-static lv_obj_t* lbl_session_label;
-static lv_obj_t* lbl_session_reset;
-static lv_obj_t* bar_weekly;
-static lv_obj_t* lbl_weekly_pct;
-static lv_obj_t* lbl_weekly_label;
-static lv_obj_t* lbl_weekly_reset;
-static lv_obj_t* lbl_anim;
+#define SCR_W       LCD_WIDTH
+#define SCR_H       LCD_HEIGHT
+#define MARGIN      12
 
-// ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
-static lv_obj_t* lbl_ble_status;
-static lv_obj_t* lbl_ble_device;
-static lv_obj_t* lbl_ble_mac;
+// ────────────────────── Subscription widgets ──────────────────────
+typedef struct {
+    lv_obj_t *root;
+    lv_obj_t *pct, *pct_sigil;
+    lv_obj_t *label, *sublabel;
+    lv_obj_t *bar, *bar_fill;
+    lv_obj_t *reset_prefix, *reset_value;
+} usage_row_t;
 
-// ---- Battery indicator (shared, on top) ----
-static lv_obj_t* battery_img;
-static lv_obj_t* logo_img;
-static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
+static lv_obj_t  *sub_container;
+static lv_obj_t  *sub_title, *sub_tag;
+static lv_obj_t  *sub_sprite_img;
+static usage_row_t sub_5h, sub_7d;
 
-// ---- Shared ----
-static lv_image_dsc_t logo_dsc;
-static screen_t current_screen = SCREEN_USAGE;
+// ────────────────────── API widgets ──────────────────────
+static lv_obj_t  *api_container;
+static lv_obj_t  *api_title, *api_tag;
+static lv_obj_t  *api_sprite_img;
+static lv_obj_t  *api_pct, *api_pct_sigil;
+static lv_obj_t  *api_token_label, *api_token_count;
+static lv_obj_t  *api_segments[20];
+static lv_obj_t  *api_reset_prefix, *api_reset_value;
+static lv_obj_t  *api_spend_label,   *api_spend_value, *api_spend_of;
+static lv_obj_t  *api_burn_label,    *api_burn_value,  *api_burn_delta;
 
-// Animation state
-static uint32_t anim_last_ms = 0;
-static uint8_t anim_spinner_idx = 0;
-static uint8_t anim_phase = 0;
-static uint8_t anim_msg_idx = 0;
-static uint32_t anim_msg_start = 0;
-#define ANIM_MSG_MS     4000
+// ────────────────────── Animation widgets ──────────────────────
+static lv_obj_t  *anim_container;
+static lv_obj_t  *anim_title, *anim_dots;
+static lv_obj_t  *anim_clawd_img;
+static lv_obj_t  *anim_gen_label, *anim_gen_pct, *anim_gen_bar_bg, *anim_gen_bar_fill;
+static lv_obj_t  *anim_ctx_label, *anim_ctx_value, *anim_ctx_bar_bg, *anim_ctx_bar_fill;
+static lv_obj_t  *anim_bulb        = nullptr;   // small yellow circle for the lightbulb beat
+static lv_obj_t  *anim_thought_dot = nullptr;   // little muted dot for the thinking beat
 
-static const char* const spinner_frames[] = {
-    "\xC2\xB7", "\xE2\x9C\xBB", "\xE2\x9C\xBD",
-    "\xE2\x9C\xB6", "\xE2\x9C\xB3", "\xE2\x9C\xA2",
-};
-#define SPINNER_COUNT 6
-#define SPINNER_PHASES (2 * (SPINNER_COUNT - 1))  // 10: ping-pong 0..5..0
+static screen_t  current_screen = SCREEN_USAGE;
+static UsageMode displayed_mode = MODE_UNKNOWN;
 
-// Per-frame hold time. Modeled on Claude Code's spinner (Cavalry triangle
-// oscillator, range 0..5, period 5s) — turn-around frames (0 and 5) appear
-// once per cycle, middle frames twice, so 0/5 read as held longer.
-static const uint16_t spinner_ms[SPINNER_COUNT] = {
-    260, 130, 130, 130, 130, 260,
-};
+enum work_phase_t { PHASE_WORKING, PHASE_THINKING, PHASE_LIGHTBULB };
+static work_phase_t cur_phase = PHASE_WORKING;
 
-static const char* const anim_messages[] = {
-    "Accomplishing", "Elucidating", "Perusing",
-    "Actioning", "Enchanting", "Philosophising",
-    "Actualizing", "Envisioning", "Pondering",
-    "Baking", "Finagling", "Pontificating",
-    "Booping", "Flibbertigibbeting", "Processing",
-    "Brewing", "Forging", "Puttering",
-    "Calculating", "Forming", "Puzzling",
-    "Cerebrating", "Frolicking", "Reticulating",
-    "Channelling", "Generating", "Ruminating",
-    "Churning", "Germinating", "Scheming",
-    "Clauding", "Hatching", "Schlepping",
-    "Coalescing", "Herding", "Shimmying",
-    "Cogitating", "Honking", "Shucking",
-    "Combobulating", "Hustling", "Simmering",
-    "Computing", "Ideating", "Smooshing",
-    "Concocting", "Imagining", "Spelunking",
-    "Conjuring", "Incubating", "Spinning",
-    "Considering", "Inferring", "Stewing",
-    "Contemplating", "Jiving", "Sussing",
-    "Cooking", "Manifesting", "Synthesizing",
-    "Crafting", "Marinating", "Thinking",
-    "Creating", "Meandering", "Tinkering",
-    "Crunching", "Moseying", "Transmuting",
-    "Deciphering", "Mulling", "Unfurling",
-    "Deliberating", "Mustering", "Unravelling",
-    "Determining", "Musing", "Vibing",
-    "Discombobulating", "Noodling", "Wandering",
-    "Divining", "Percolating", "Whirring",
-    "Doing", "Wibbling",
-    "Effecting", "Wizarding",
-    "Working", "Wrangling",
-};
-#define ANIM_MSG_COUNT (sizeof(anim_messages) / sizeof(anim_messages[0]))
+// Walk-cycle + progress-bar synthetic animation state
+static uint8_t   walk_frame    = 1;          // alternates 1↔2 (walkA, walkB)
+static uint32_t  walk_last_ms  = 0;
+static uint32_t  dot_last_ms   = 0;
+static uint8_t   dot_phase     = 0;          // 0..2 chases through the three dots
+static float     gen_progress  = 0.05f;
+static uint32_t  gen_last_ms   = 0;
 
-static lv_color_t pct_color(float pct) {
-    if (pct >= 80.0f) return COL_RED;
-    if (pct >= 50.0f) return COL_AMBER;
-    return COL_GREEN;
-}
+// Working-line state. The daemon anchors task_seconds occasionally;
+// the firmware advances the displayed timer locally so we get a smooth
+// 1s-per-second readout without per-second BLE traffic.
+static uint32_t  task_tokens_latched  = 0;
+static uint32_t  task_seconds_at_sync = 0;
+static uint32_t  task_sync_tick_ms    = 0;
+static bool      task_active_latched  = false;
 
-static void format_reset_time(int mins, char* buf, size_t len) {
-    if (mins < 0) {
-        snprintf(buf, len, "---");
-    } else if (mins < 60) {
-        snprintf(buf, len, "Resets in %dm", mins);
-    } else if (mins < 1440) {
-        snprintf(buf, len, "Resets in %dh %dm", mins / 60, mins % 60);
-    } else {
-        snprintf(buf, len, "Resets in %dd %dh", mins / 1440, (mins % 1440) / 60);
+static void render_working_line(void) {
+    uint32_t s = task_seconds_at_sync;
+    if (task_active_latched) {
+        // Add wall-clock seconds since the last sync. lv_tick_get() is
+        // monotonic and millisecond-granular.
+        uint32_t delta_ms = lv_tick_get() - task_sync_tick_ms;
+        s += delta_ms / 1000;
     }
+    char buf[32];
+    char tok[16];
+    // Spinner: while a turn is mid-flight but no output tokens have
+    // landed yet, show a rotating ASCII glyph instead of "0".
+    if (task_active_latched && task_tokens_latched == 0) {
+        static const char* SPIN_FRAMES = "|/-\\";
+        uint32_t spin_idx = (lv_tick_get() / 120) & 3;
+        tok[0] = SPIN_FRAMES[spin_idx];
+        tok[1] = '\0';
+    } else if (task_tokens_latched < 1000) {
+        snprintf(tok, sizeof(tok), "%u",     (unsigned)task_tokens_latched);
+    } else if (task_tokens_latched < 100000) {
+        snprintf(tok, sizeof(tok), "%.1fk",  task_tokens_latched / 1000.0);
+    } else {
+        snprintf(tok, sizeof(tok), "%.0fk",  task_tokens_latched / 1000.0);
+    }
+    if (s < 60)        snprintf(buf, sizeof(buf), "%s   %us",     tok, (unsigned)s);
+    else if (s < 3600) snprintf(buf, sizeof(buf), "%s   %u:%02u", tok, (unsigned)(s / 60), (unsigned)(s % 60));
+    else               snprintf(buf, sizeof(buf), "%s   %uh%02u", tok, (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
+    if (anim_gen_pct) lv_label_set_text(anim_gen_pct, buf);
 }
 
-// Forward decls — callbacks defined near ui_show_screen below
-static void global_click_cb(lv_event_t* e);
-static void ble_reset_click_cb(lv_event_t* e);
+// ────────────────────── Helpers ──────────────────────
 
-static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
-    lv_obj_t* panel = lv_obj_create(parent);
-    lv_obj_set_pos(panel, x, y);
-    lv_obj_set_size(panel, w, h);
-    lv_obj_set_style_bg_color(panel, COL_PANEL, 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(panel, 8, 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
-    lv_obj_set_style_pad_left(panel, 16, 0);
-    lv_obj_set_style_pad_right(panel, 16, 0);
-    lv_obj_set_style_pad_top(panel, 12, 0);
-    lv_obj_set_style_pad_bottom(panel, 12, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    // Bubble click events up to the screen / usage_container so a tap anywhere
-    // on the panel fires the global click handler.
-    lv_obj_add_flag(panel, LV_OBJ_FLAG_EVENT_BUBBLE);
-    return panel;
+static lv_obj_t* make_container(lv_obj_t* parent) {
+    lv_obj_t* c = lv_obj_create(parent);
+    lv_obj_set_size(c, SCR_W, SCR_H);
+    lv_obj_set_pos(c, 0, 0);
+    lv_obj_set_style_bg_color(c, THEME_BG, 0);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_pad_all(c, 0, 0);
+    lv_obj_set_style_radius(c, 0, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    return c;
 }
 
-static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
-    lv_obj_t* bar = lv_bar_create(parent);
-    lv_obj_set_pos(bar, x, y);
-    lv_obj_set_size(bar, w, h);
-    lv_bar_set_range(bar, 0, 100);
-    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(bar, COL_BAR_BG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, COL_GREEN, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
-    return bar;
+// A bare positioning <div> with no chrome (no bg, no border).
+static lv_obj_t* make_pane(lv_obj_t* parent, int x, int y, int w, int h) {
+    lv_obj_t* p = lv_obj_create(parent);
+    lv_obj_set_pos(p, x, y);
+    lv_obj_set_size(p, w, h);
+    lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(p, 0, 0);
+    lv_obj_set_style_pad_all(p, 0, 0);
+    lv_obj_set_style_radius(p, 0, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    return p;
 }
 
-static void init_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint16_t* data) {
-    dsc->header.w = w;
-    dsc->header.h = h;
-    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
-    dsc->header.stride = w * 2;
-    dsc->data = (const uint8_t*)data;
-    dsc->data_size = w * h * 2;
+static lv_obj_t* make_label(lv_obj_t* parent, const lv_font_t* font, lv_color_t color,
+                            const char* text) {
+    lv_obj_t* l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, color, 0);
+    return l;
 }
 
-// RGB565A8: planar — w*h RGB565 pixels followed by w*h alpha bytes.
-// Stride is RGB565-only (w*2); LVGL infers alpha plane location from header.
-static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint8_t* data) {
-    dsc->header.w = w;
-    dsc->header.h = h;
-    dsc->header.cf = LV_COLOR_FORMAT_RGB565A8;
-    dsc->header.stride = w * 2;
-    dsc->data = data;
-    dsc->data_size = w * h * 3;
+// Build a row matching SubScreen's <Row> in screens.jsx, scaled up for
+// the 1.3" panel viewed through the prism — bigger fonts, thicker bar,
+// more breathing room.
+//
+// Row stack (88 px tall):
+//   y=0:  % left (M48) + label/sublabel right (M18/M14)
+//   y=54: 10-px bar
+//   y=68: "Resets in <value>" (M14 / M18)
+static void build_usage_row(lv_obj_t* parent, int top, lv_color_t color, lv_color_t color_deep,
+                            const char* label, const char* sublabel, usage_row_t* out) {
+    out->root = make_pane(parent, MARGIN, top, SCR_W - 2 * MARGIN, 88);
+
+    out->pct = make_label(out->root, &lv_font_montserrat_48, color, "--");
+    lv_obj_align(out->pct, LV_ALIGN_TOP_LEFT, 0, -6);
+
+    out->pct_sigil = make_label(out->root, &lv_font_montserrat_28, color_deep, "%");
+    lv_obj_align_to(out->pct_sigil, out->pct, LV_ALIGN_OUT_RIGHT_BOTTOM, 1, -4);
+
+    out->label = make_label(out->root, &lv_font_montserrat_18, THEME_TEXT, label);
+    lv_obj_align(out->label, LV_ALIGN_TOP_RIGHT, 0, 4);
+
+    out->sublabel = make_label(out->root, &lv_font_montserrat_14, THEME_TEXT_MUTED, sublabel);
+    lv_obj_align_to(out->sublabel, out->label, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 4);
+
+    out->bar = make_pane(out->root, 0, 52, SCR_W - 2 * MARGIN, 10);
+    lv_obj_set_style_bg_color(out->bar, THEME_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(out->bar, LV_OPA_COVER, 0);
+
+    out->bar_fill = make_pane(out->root, 0, 52, 0, 10);
+    lv_obj_set_style_bg_color(out->bar_fill, color, 0);
+    lv_obj_set_style_bg_opa(out->bar_fill, LV_OPA_COVER, 0);
+
+    out->reset_prefix = make_label(out->root, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Resets in");
+    lv_obj_set_pos(out->reset_prefix, 0, 68);
+
+    out->reset_value = make_label(out->root, &lv_font_montserrat_18, THEME_TEXT, "---");
+    lv_obj_align_to(out->reset_value, out->reset_prefix, LV_ALIGN_OUT_RIGHT_MID, 6, -1);
 }
 
-static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
-    lv_obj_t* lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl, 18, 0);
-    lv_obj_set_style_pad_right(lbl, 18, 0);
-    lv_obj_set_style_pad_top(lbl, 6, 0);
-    lv_obj_set_style_pad_bottom(lbl, 6, 0);
-    return lbl;
+static void set_usage_row(usage_row_t* r, int pct, int reset_mins) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    lv_label_set_text_fmt(r->pct, "%d", pct);
+    lv_obj_align_to(r->pct_sigil, r->pct, LV_ALIGN_OUT_RIGHT_BOTTOM, 1, -4);
+
+    int bar_w = (SCR_W - 2 * MARGIN) * pct / 100;
+    lv_obj_set_size(r->bar_fill, bar_w, 10);
+
+    // Session mode (reset_mins < 0) has no "resets in" semantic — hide both
+    // the prefix and the value so the row reads cleanly.
+    if (reset_mins < 0) {
+        lv_obj_add_flag(r->reset_prefix, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(r->reset_value,  LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(r->reset_prefix, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(r->reset_value,  LV_OBJ_FLAG_HIDDEN);
+    char buf[24];
+    if (reset_mins < 60)         snprintf(buf, sizeof(buf), "%dm", reset_mins);
+    else if (reset_mins < 1440)  snprintf(buf, sizeof(buf), "%dh %dm", reset_mins / 60, reset_mins % 60);
+    else                         snprintf(buf, sizeof(buf), "%dd %dh", reset_mins / 1440, (reset_mins % 1440) / 60);
+    lv_label_set_text(r->reset_value, buf);
 }
 
-// ---- Battery icon initialization ----
-static void init_battery_icons(void) {
-    init_icon_dsc_rgb565a8(&battery_dscs[0], ICON_BATTERY_W, ICON_BATTERY_H, icon_battery_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[1], ICON_BATTERY_LOW_W, ICON_BATTERY_LOW_H, icon_battery_low_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[2], ICON_BATTERY_MEDIUM_W, ICON_BATTERY_MEDIUM_H, icon_battery_medium_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[3], ICON_BATTERY_FULL_W, ICON_BATTERY_FULL_H, icon_battery_full_data);
-    init_icon_dsc_rgb565a8(&battery_dscs[4], ICON_BATTERY_CHARGING_W, ICON_BATTERY_CHARGING_H, icon_battery_charging_data);
+// Title bar across Sub / API screens. Title is the model name (e.g.
+// "Opus 4.7 1M"); the MAX/API tag sits to the right of the title.
+static void build_title_bar(lv_obj_t* parent, const char* tag_text,
+                            lv_obj_t** out_title, lv_obj_t** out_sprite,
+                            lv_obj_t** out_tag) {
+    *out_title = make_label(parent, &lv_font_montserrat_24, THEME_TEXT, "Usage");
+    lv_obj_set_pos(*out_title, MARGIN, 4);
+
+    *out_sprite = lv_image_create(parent);
+    lv_image_set_src(*out_sprite, clawd_sprite_tiny());
+    lv_obj_align(*out_sprite, LV_ALIGN_TOP_RIGHT, -MARGIN, 6);
+
+    *out_tag = make_label(parent, &lv_font_montserrat_14, THEME_TEXT_MUTED, tag_text);
+    lv_obj_align_to(*out_tag, *out_sprite, LV_ALIGN_OUT_LEFT_MID, -4, 0);
 }
 
-// ======== Usage Screen (480x480) ========
+// ────────────────────── Subscription screen ──────────────────────
 
-#define PANEL_H     150
-#define PANEL_GAP   16
+static void init_subscription_screen(lv_obj_t* parent) {
+    sub_container = make_container(parent);
+    build_title_bar(sub_container, "MAX", &sub_title, &sub_sprite_img, &sub_tag);
 
-// One Session/Weekly panel: big % label, pill on the right, bar, reset label.
-// Pill y=1: symmetric inside the panel — panel-outer-top → pill-top equals
-// pill-bottom → bar-top (pill height 42 + panel pad_top 12 + bar y=56).
-static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
-                             lv_obj_t** out_pct, lv_obj_t** out_pill,
-                             lv_obj_t** out_bar, lv_obj_t** out_reset) {
-    lv_obj_t* panel = make_panel(parent, MARGIN, y, CONTENT_W, PANEL_H);
+    // Layout (240 vertical):
+    //   y=  4..36   title bar (M28 + sprite + tag)
+    //   y= 42..130  row 1: Current  (88 px tall, see build_usage_row)
+    //   y=134       hairline (1 px)
+    //   y=140..228  row 2: Weekly
+    //   y=228..240  bottom margin
+    build_usage_row(sub_container, 42,  THEME_ACCENT, THEME_ACCENT_DEEP,
+                    "Current", "5h window", &sub_5h);
 
-    *out_pct = lv_label_create(panel);
-    lv_label_set_text(*out_pct, "---%");
-    lv_obj_set_style_text_font(*out_pct, &font_styrene_48, 0);
-    lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
-    lv_obj_set_pos(*out_pct, 0, 0);
+    lv_obj_t* hr = make_pane(sub_container, MARGIN, 134, SCR_W - 2 * MARGIN, 1);
+    lv_obj_set_style_bg_color(hr, THEME_HAIRLINE, 0);
+    lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
 
-    *out_pill = make_pill(panel, pill_text);
-    lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 1);
-
-    *out_bar = make_bar(panel, 0, 56, CONTENT_W - 32, 24);
-
-    *out_reset = lv_label_create(panel);
-    lv_label_set_text(*out_reset, "---");
-    lv_obj_set_style_text_font(*out_reset, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-    lv_obj_set_pos(*out_reset, 0, 94);
+    build_usage_row(sub_container, 140, THEME_AMBER,  THEME_AMBER_DEEP,
+                    "Weekly",  "7d window", &sub_7d);
 }
 
-static void init_usage_screen(lv_obj_t* scr) {
-    usage_container = lv_obj_create(scr);
-    lv_obj_set_size(usage_container, SCR_W, SCR_H);
-    lv_obj_set_pos(usage_container, 0, 0);
-    lv_obj_set_style_bg_opa(usage_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(usage_container, 0, 0);
-    lv_obj_set_style_pad_all(usage_container, 0, 0);
-    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+// ────────────────────── API screen ──────────────────────
 
-    lbl_title = lv_label_create(usage_container);
-    lv_label_set_text(lbl_title, "Usage");
-    lv_obj_set_style_text_font(lbl_title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+static void init_api_screen(lv_obj_t* parent) {
+    api_container = make_container(parent);
+    build_title_bar(api_container, "API", &api_title, &api_sprite_img, &api_tag);
 
-    make_usage_panel(usage_container, CONTENT_Y, "Current",
-                     &lbl_session_pct, &lbl_session_label,
-                     &bar_session, &lbl_session_reset);
-    make_usage_panel(usage_container, CONTENT_Y + PANEL_H + PANEL_GAP, "Weekly",
-                     &lbl_weekly_pct, &lbl_weekly_label,
-                     &bar_weekly, &lbl_weekly_reset);
+    // y=42  big % (M48) + Tokens / token-count right column
+    api_pct = make_label(api_container, &lv_font_montserrat_48, THEME_ACCENT, "--");
+    lv_obj_set_pos(api_pct, MARGIN, 42);
 
-    lbl_anim = lv_label_create(usage_container);
-    lv_label_set_text(lbl_anim, "");
-    lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
-    lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
-    lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
+    api_pct_sigil = make_label(api_container, &lv_font_montserrat_36, THEME_ACCENT_DEEP, "%");
+    lv_obj_align_to(api_pct_sigil, api_pct, LV_ALIGN_OUT_RIGHT_BOTTOM, 2, -6);
+
+    api_token_label = make_label(api_container, &lv_font_montserrat_18, THEME_TEXT, "Tokens");
+    lv_obj_align(api_token_label, LV_ALIGN_TOP_RIGHT, -MARGIN, 48);
+
+    api_token_count = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "0 / 0");
+    lv_obj_align_to(api_token_count, api_token_label, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 4);
+
+    // y=112: 12-px segmented bar (10 segments — wider/thicker cells at this scale)
+    {
+        int avail = SCR_W - 2 * MARGIN;
+        int gap = 3;
+        int seg_count = 10;
+        int seg_w = (avail - gap * (seg_count - 1)) / seg_count;
+        for (int i = 0; i < 20; i++) api_segments[i] = nullptr;
+        int x = MARGIN;
+        for (int i = 0; i < seg_count; i++) {
+            lv_obj_t* s = make_pane(api_container, x, 112, seg_w, 12);
+            lv_obj_set_style_bg_color(s, THEME_BAR_BG, 0);
+            lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+            api_segments[i] = s;
+            x += seg_w + gap;
+        }
+    }
+
+    // y=130: "Resets in 11d 4h"
+    api_reset_prefix = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Resets in");
+    lv_obj_set_pos(api_reset_prefix, MARGIN, 130);
+
+    api_reset_value = make_label(api_container, &lv_font_montserrat_18, THEME_TEXT, "---");
+    lv_obj_align_to(api_reset_value, api_reset_prefix, LV_ALIGN_OUT_RIGHT_MID, 6, -1);
+
+    // Hairline at y=160
+    lv_obj_t* hr = make_pane(api_container, MARGIN, 160, SCR_W - 2 * MARGIN, 1);
+    lv_obj_set_style_bg_color(hr, THEME_HAIRLINE, 0);
+    lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
+
+    // y=168..232: Spend (left) + Burn (right)
+    api_spend_label = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Spend");
+    lv_obj_set_pos(api_spend_label, MARGIN, 168);
+
+    api_spend_value = make_label(api_container, &lv_font_montserrat_28, THEME_TEXT, "$0.00");
+    lv_obj_align_to(api_spend_value, api_spend_label, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    api_spend_of = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "of $0");
+    lv_obj_align_to(api_spend_of, api_spend_value, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    api_burn_label = make_label(api_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "Burn/min");
+    lv_obj_align(api_burn_label, LV_ALIGN_TOP_RIGHT, -MARGIN, 168);
+
+    api_burn_value = make_label(api_container, &lv_font_montserrat_28, THEME_ACCENT, "--");
+    lv_obj_align_to(api_burn_value, api_burn_label, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 2);
+
+    api_burn_delta = make_label(api_container, &lv_font_montserrat_14, THEME_AMBER, "--");
+    lv_obj_align_to(api_burn_delta, api_burn_value, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 2);
 }
 
-// ======== Bluetooth Screen (480x480) ========
+// ────────────────────── Animation screen ──────────────────────
 
-static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, SCR_W, SCR_H);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
+static void init_animation_screen(lv_obj_t* parent) {
+    anim_container = make_container(parent);
 
-    // Title
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    // Header removed: the figure gets the headroom now. anim_title /
+    // anim_dots are kept as hidden stubs so the rest of the code that
+    // touches them stays compiling.
+    anim_title = make_label(anim_container, &lv_font_montserrat_14, THEME_TEXT, "");
+    anim_dots  = make_label(anim_container, &lv_font_montserrat_14, THEME_ACCENT, "");
+    lv_obj_add_flag(anim_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(anim_dots,  LV_OBJ_FLAG_HIDDEN);
 
-    // Info panel (taller for 480x480)
-    lv_obj_t* p_info = make_panel(ble_container, MARGIN, CONTENT_Y, CONTENT_W, 160);
+    // Clawd, centered horizontally — room left at the top so the head
+    // doesn't clip against the bezel; later ticks bob/sway around this.
+    anim_clawd_img = lv_image_create(anim_container);
+    lv_image_set_src(anim_clawd_img, clawd_sprite_large(0));
+    lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID, 0, 20);
 
-    // Bluetooth icon + status row
-    static lv_image_dsc_t icon_bt_dsc;
-    init_icon_dsc(&icon_bt_dsc, ICON_BLUETOOTH_W, ICON_BLUETOOTH_H, icon_bluetooth_data);
+    // (The lightbulb beat now replaces the entire figure with a yellow
+    // bulb sprite — no separate overlay widget needed.)
+    anim_bulb = nullptr;
 
-    lv_obj_t* bt_img = lv_image_create(p_info);
-    lv_image_set_src(bt_img, &icon_bt_dsc);
-    lv_obj_set_pos(bt_img, 0, 0);
+    // Thought dot — a small muted bubble that drifts up during the
+    // thinking beat. Hidden by default.
+    anim_thought_dot = lv_obj_create(anim_container);
+    lv_obj_remove_style_all(anim_thought_dot);
+    lv_obj_set_size(anim_thought_dot, 10, 10);
+    lv_obj_set_style_radius(anim_thought_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(anim_thought_dot, THEME_TEXT_MUTED, 0);
+    lv_obj_set_style_bg_opa(anim_thought_dot, LV_OPA_COVER, 0);
+    lv_obj_align(anim_thought_dot, LV_ALIGN_TOP_MID, 28, 14);
+    lv_obj_add_flag(anim_thought_dot, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_ble_status = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_status, "Initializing...");
-    lv_obj_set_style_text_font(lbl_ble_status, &font_styrene_48, 0);
-    lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_status, 56, 2);
+    // No "GENERATING" label — just the tokens + elapsed time, centered
+    // and large so it reads at a glance from across the desk.
+    anim_gen_label = make_label(anim_container, &lv_font_montserrat_14, THEME_TEXT_MUTED, "");
+    lv_obj_add_flag(anim_gen_label, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_ble_device = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_device, "Device: ---");
-    lv_obj_set_style_text_font(lbl_ble_device, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl_ble_device, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_device, 0, 64);
+    anim_gen_pct = make_label(anim_container, &lv_font_montserrat_36, THEME_ACCENT, "--");
+    lv_obj_align(anim_gen_pct, LV_ALIGN_TOP_MID, 0, 156);
 
-    lbl_ble_mac = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_mac, "Address: ---");
-    lv_obj_set_style_text_font(lbl_ble_mac, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_mac, 0, 100);
+    // Progress bar removed; stubs kept for back-compat with existing refs.
+    anim_gen_bar_bg   = make_pane(anim_container, MARGIN, 180, SCR_W - 2 * MARGIN, 0);
+    anim_gen_bar_fill = make_pane(anim_container, MARGIN, 180, 0, 0);
+    lv_obj_add_flag(anim_gen_bar_bg,   LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(anim_gen_bar_fill, LV_OBJ_FLAG_HIDDEN);
 
-    // Reset Bluetooth tap zone with trash icon
-    int reset_y = CONTENT_Y + 160 + 16;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
-    lv_obj_set_pos(reset_zone, MARGIN, reset_y);
-    lv_obj_set_size(reset_zone, CONTENT_W, 110);
-    lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
-    lv_obj_set_style_bg_opa(reset_zone, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(reset_zone, 8, 0);
-    lv_obj_set_style_border_width(reset_zone, 0, 0);
-    lv_obj_set_style_pad_column(reset_zone, 14, 0);
-    lv_obj_set_flex_flow(reset_zone, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(reset_zone, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(reset_zone, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(reset_zone, ble_reset_click_cb, LV_EVENT_CLICKED, NULL);
+    // CONTEXT bar — bumped to 18pt for legibility from across the desk.
+    anim_ctx_label = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT_MUTED, "CONTEXT");
+    lv_obj_set_pos(anim_ctx_label, MARGIN, 202);
 
-    static lv_image_dsc_t icon_trash_dsc;
-    init_icon_dsc(&icon_trash_dsc, ICON_TRASH2_W, ICON_TRASH2_H, icon_trash2_data);
-    lv_obj_t* trash_img = lv_image_create(reset_zone);
-    lv_image_set_src(trash_img, &icon_trash_dsc);
+    anim_ctx_value = make_label(anim_container, &lv_font_montserrat_18, THEME_TEXT, "--");
+    lv_obj_align(anim_ctx_value, LV_ALIGN_TOP_RIGHT, -MARGIN, 202);
 
-    lv_obj_t* reset_lbl = lv_label_create(reset_zone);
-    lv_label_set_text(reset_lbl, "Reset Bluetooth");
-    lv_obj_set_style_text_font(reset_lbl, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
+    anim_ctx_bar_bg = make_pane(anim_container, MARGIN, 224, SCR_W - 2 * MARGIN, 8);
+    lv_obj_set_style_bg_color(anim_ctx_bar_bg, THEME_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(anim_ctx_bar_bg, LV_OPA_COVER, 0);
 
-    // Attribution
-    lv_obj_t* lbl_credit = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit, "Built by @hermannbjorgvin");
-    lv_obj_set_style_text_font(lbl_credit, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_credit, COL_DIM, 0);
-    lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -46);
-
-    lv_obj_t* lbl_credit2 = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit2, "Clawd animation by @amaanbuilds");
-    lv_obj_set_style_text_font(lbl_credit2, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_credit2, COL_DIM, 0);
-    lv_obj_align(lbl_credit2, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    // Start hidden
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    anim_ctx_bar_fill = make_pane(anim_container, MARGIN, 224, 0, 8);
+    lv_obj_set_style_bg_color(anim_ctx_bar_fill, THEME_GREEN, 0);
+    lv_obj_set_style_bg_opa(anim_ctx_bar_fill, LV_OPA_COVER, 0);
 }
 
-// ======== Public API ========
+// ────────────────────── Public API ──────────────────────
 
 void ui_init(void) {
+    clawd_sprite_init();
+
     lv_obj_t* scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, COL_BG, 0);
+    lv_obj_set_style_bg_color(scr, THEME_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    // Logo (shared, always visible, on top of all containers)
-    // Logo is RGB565A8 (planar: w*h RGB565 then w*h alpha) so it composites
-    // cleanly against whatever bg is behind it.
-    init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
+    init_subscription_screen(scr);
+    init_api_screen(scr);
+    init_animation_screen(scr);
 
-    // Initialize battery icon descriptors
-    init_battery_icons();
+    lv_obj_add_flag(api_container,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
+}
 
-    init_usage_screen(scr);
-    init_bluetooth_screen(scr);
-    splash_init(scr);
-
-    // Splash is touch-toggled — tap anywhere on the splash dismisses it
-    if (splash_get_root()) {
-        lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
+static void apply_mode_visibility(void) {
+    if (current_screen != SCREEN_USAGE) return;
+    if (displayed_mode == MODE_API) {
+        lv_obj_add_flag(sub_container,   LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(api_container, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(sub_container, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(api_container,   LV_OBJ_FLAG_HIDDEN);
     }
+}
 
-    // Logo on top of all containers (inset for rounded corners)
-    logo_img = lv_image_create(scr);
-    lv_image_set_src(logo_img, &logo_dsc);
-    lv_obj_set_pos(logo_img, MARGIN, TITLE_Y - 10);
+static void format_token_count(uint64_t n, char* buf, size_t len) {
+    if (n < 1000ULL)            snprintf(buf, len, "%llu",   (unsigned long long)n);
+    else if (n < 1000000ULL)    snprintf(buf, len, "%.0fk",  n / 1000.0);
+    else if (n < 1000000000ULL) snprintf(buf, len, "%.1fM",  n / 1000000.0);
+    else                        snprintf(buf, len, "%.1fB",  n / 1000000000.0);
+}
 
-    // Battery indicator on top of all containers (upper-right, inset)
-    battery_img = lv_image_create(scr);
-    lv_image_set_src(battery_img, &battery_dscs[0]);
-    lv_obj_set_pos(battery_img, SCR_W - 48 - MARGIN, TITLE_Y);
+// Health gradient for the context bar — picks a color band based on
+// current_pct (0..100). Bands per design: <10 green, <20 dark green,
+// <40 blue, <60 yellow, <80 orange, ≥80 red.
+static lv_color_t context_color_for(int pct) {
+    if (pct < 10) return lv_color_hex(0x00C060);  // bright green
+    if (pct < 20) return lv_color_hex(0x008040);  // dark green
+    if (pct < 40) return lv_color_hex(0x1090E0);  // blue
+    if (pct < 60) return lv_color_hex(0xFFD000);  // yellow
+    if (pct < 80) return lv_color_hex(0xFF7000);  // orange
+    return        lv_color_hex(0xE61500);          // red
 }
 
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
 
-    int s_pct = (int)(data->session_pct + 0.5f);
+    bool mode_changed = (displayed_mode != data->mode);
+    displayed_mode = data->mode;
+    if (mode_changed) apply_mode_visibility();
 
-    // Usage screen
-    lv_label_set_text_fmt(lbl_session_pct, "%d%%", s_pct);
-    lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+    // Title: model name when known, else fall back to "Usage". The
+    // MAX/API badge sits to its right.
+    const char* title_text = data->model_label[0] ? data->model_label : "Usage";
+    lv_label_set_text(sub_title, title_text);
+    lv_label_set_text(api_title, title_text);
+    lv_label_set_text(sub_tag, "MAX");
+    lv_label_set_text(api_tag, "API");
+    lv_obj_clear_flag(sub_tag, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(api_tag, LV_OBJ_FLAG_HIDDEN);
 
-    char buf[48];
-    format_reset_time(data->session_reset_mins, buf, sizeof(buf));
-    lv_label_set_text(lbl_session_reset, buf);
+    if (data->mode == MODE_API) {
+        int pct = 0;
+        if (data->tokens_quota > 0) {
+            double p = (double)data->tokens_used * 100.0 / (double)data->tokens_quota;
+            pct = (int)(p + 0.5);
+            if (pct > 100) pct = 100;
+        }
+        lv_label_set_text_fmt(api_pct, "%d", pct);
+        lv_obj_align_to(api_pct_sigil, api_pct, LV_ALIGN_OUT_RIGHT_BOTTOM, 2, -6);
 
-    int w_pct = (int)(data->weekly_pct + 0.5f);
-    lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
-    lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+        // Segmented bar fill (10 cells; last 2 turn amber when filled).
+        int filled = (pct * 10 + 50) / 100;
+        const int hot_start = 8;
+        for (int i = 0; i < 10; i++) {
+            if (!api_segments[i]) continue;
+            lv_color_t c = THEME_BAR_BG;
+            if (i < filled) c = (i >= hot_start) ? THEME_AMBER : THEME_ACCENT;
+            lv_obj_set_style_bg_color(api_segments[i], c, 0);
+        }
 
-    format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
-    lv_label_set_text(lbl_weekly_reset, buf);
-}
+        char buf[32], buf2[32];
+        format_token_count(data->tokens_used,  buf,  sizeof(buf));
+        format_token_count(data->tokens_quota, buf2, sizeof(buf2));
+        char count[48];
+        if (data->tokens_quota > 0) snprintf(count, sizeof(count), "%s / %s", buf, buf2);
+        else                        snprintf(count, sizeof(count), "%s used", buf);
+        lv_label_set_text(api_token_count, count);
 
-void ui_tick_anim(void) {
-    if (current_screen != SCREEN_USAGE) return;
+        if (data->api_reset_mins < 0)            snprintf(buf, sizeof(buf), "---");
+        else if (data->api_reset_mins < 60)      snprintf(buf, sizeof(buf), "%dm", data->api_reset_mins);
+        else if (data->api_reset_mins < 1440)    snprintf(buf, sizeof(buf), "%dh %dm",
+                                                          data->api_reset_mins / 60,
+                                                          data->api_reset_mins % 60);
+        else                                     snprintf(buf, sizeof(buf), "%dd %dh",
+                                                          data->api_reset_mins / 1440,
+                                                          (data->api_reset_mins % 1440) / 60);
+        lv_label_set_text(api_reset_value, buf);
 
-    uint32_t now = lv_tick_get();
+        // Spend $X.XX / of $Y
+        int spent  = data->dollars_spent_cents;
+        int budget = data->dollars_budget_cents;
+        char money[16];
+        snprintf(money, sizeof(money), "$%d.%02d", spent / 100, spent % 100);
+        lv_label_set_text(api_spend_value, money);
+        if (budget > 0) snprintf(money, sizeof(money), "of $%d", budget / 100);
+        else            snprintf(money, sizeof(money), "no cap");
+        lv_label_set_text(api_spend_of, money);
 
-    if (now - anim_msg_start >= ANIM_MSG_MS) {
-        anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
-        anim_msg_start = now;
+        // Burn / min
+        format_token_count((uint64_t)data->burn_per_min, buf, sizeof(buf));
+        lv_label_set_text(api_burn_value, buf);
+        if (data->burn_pct_change >= 0) snprintf(buf, sizeof(buf), "↑ %d%% avg", data->burn_pct_change);
+        else                            snprintf(buf, sizeof(buf), "↓ %d%% avg", -data->burn_pct_change);
+        lv_label_set_text(api_burn_delta, buf);
+        lv_obj_set_style_text_color(api_burn_delta,
+            data->burn_pct_change >= 0 ? THEME_AMBER : THEME_GREEN, 0);
+    } else {
+        set_usage_row(&sub_5h, (int)(data->session_pct + 0.5f), data->session_reset_mins);
+        set_usage_row(&sub_7d, (int)(data->weekly_pct  + 0.5f), data->weekly_reset_mins);
     }
 
-    if (now - anim_last_ms >= spinner_ms[anim_spinner_idx]) {
-        anim_last_ms = now;
-        anim_phase = (anim_phase + 1) % SPINNER_PHASES;
-        anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
-                                                        : (SPINNER_PHASES - anim_phase);
+    // Context bar on the animation screen (shared across modes)
+    if (data->ctx_max > 0) {
+        char buf[32];
+        // Format the cap as "1M" when we're on the million-token variant,
+        // otherwise as "<n>k" — much more readable than "1000k".
+        if (data->ctx_max >= 1000000ULL) {
+            snprintf(buf, sizeof(buf), "%.1fk / %lluM",
+                     data->ctx_used / 1000.0,
+                     (unsigned long long)(data->ctx_max / 1000000));
+        } else {
+            snprintf(buf, sizeof(buf), "%.1fk / %lluk",
+                     data->ctx_used / 1000.0,
+                     (unsigned long long)(data->ctx_max / 1000));
+        }
+        lv_label_set_text(anim_ctx_value, buf);
+        int avail = SCR_W - 2 * MARGIN;
+        int w = (int)((double)data->ctx_used * (double)avail / (double)data->ctx_max);
+        if (w > avail) w = avail;
+        lv_obj_set_size(anim_ctx_bar_fill, w, 8);
+        // Health gradient: green → red as the window fills up.
+        int pct = (int)(data->ctx_used * 100ULL / data->ctx_max);
+        lv_obj_set_style_bg_color(anim_ctx_bar_fill, context_color_for(pct), 0);
+    } else {
+        lv_label_set_text(anim_ctx_value, "--");
+        lv_obj_set_size(anim_ctx_bar_fill, 0, 8);
+    }
 
-        static char buf[80];
-        snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
-                 spinner_frames[anim_spinner_idx],
-                 anim_messages[anim_msg_idx]);
-        lv_label_set_text(lbl_anim, buf);
+    // Latch the working-line state. The label itself is rendered on
+    // every animation tick from task_anchor_* so the timer advances
+    // one second per second locally, without per-second BLE traffic.
+    task_tokens_latched   = data->task_tokens;
+    task_seconds_at_sync  = data->task_seconds;
+    task_sync_tick_ms     = lv_tick_get();
+    task_active_latched   = data->session_active;
+    render_working_line();
+
+    // Phase swap drives which animation sequence runs and which overlay
+    // (lightbulb glow / thought dot) is shown.
+    work_phase_t new_phase = PHASE_WORKING;
+    if (strcmp(data->phase, "thinking")  == 0) new_phase = PHASE_THINKING;
+    if (strcmp(data->phase, "lightbulb") == 0) new_phase = PHASE_LIGHTBULB;
+    if (new_phase != cur_phase) {
+        cur_phase = new_phase;
+        walk_last_ms = 0;  // re-arm so the new sequence starts immediately
+    }
+    if (anim_bulb) {
+        if (cur_phase == PHASE_LIGHTBULB) lv_obj_clear_flag(anim_bulb, LV_OBJ_FLAG_HIDDEN);
+        else                              lv_obj_add_flag(anim_bulb,   LV_OBJ_FLAG_HIDDEN);
+    }
+    if (anim_thought_dot) {
+        if (cur_phase == PHASE_THINKING) lv_obj_clear_flag(anim_thought_dot, LV_OBJ_FLAG_HIDDEN);
+        else                             lv_obj_add_flag(anim_thought_dot,   LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Auto-switch: when Claude Code is mid-turn, jump to the working/anim
+    // view; when it goes idle, return to the usage view. We only react to
+    // *transitions* so a touch toggle isn't fought against on every push.
+    static bool last_active_known = false;
+    static bool last_active = false;
+    bool act = data->session_active;
+    if (!last_active_known || act != last_active) {
+        last_active_known = true;
+        last_active = act;
+        if (act && current_screen != SCREEN_SPLASH) {
+            ui_show_screen(SCREEN_SPLASH);
+        } else if (!act && current_screen == SCREEN_SPLASH) {
+            ui_show_screen(SCREEN_USAGE);
+        }
+    }
+}
+
+// Frame indices: 0,1 idle walk-cycle  2 blink  3 squint
+//                4 look-left  5 look-right  6 wide/surprise  7 sleepy
+
+// Default "working" cycle — mixes everyday expressions.
+static const uint8_t ANIM_WORKING[] = {
+    0, 1, 0, 1, 0, 1, 2,
+    0, 1, 4, 0, 5, 0,
+    0, 1, 0, 1, 3,
+    0, 1, 0, 1, 6,
+    0, 1, 7, 7,
+    0, 1, 2,
+};
+// "Thinking" cycle — heavier on sleepy/squint/look-around, fewer steps,
+// longer holds. Reads as focused / contemplative.
+static const uint8_t ANIM_THINKING[] = {
+    7, 7, 3, 3, 4, 4, 5, 5,
+    7, 3, 0, 7, 3, 2,
+};
+// "Lightbulb" cycle — the figure is replaced by a yellow bulb sprite
+// that twinkles for a few beats. Frames 8 (plain) / 9 (with shine).
+static const uint8_t ANIM_LIGHTBULB[] = {
+    8, 9, 8, 9, 8, 9, 8, 9,
+};
+
+struct anim_phase_def_t {
+    const uint8_t* seq;
+    uint16_t       len;
+    uint16_t       interval_ms;
+};
+static const anim_phase_def_t PHASE_ANIM[] = {
+    /* PHASE_WORKING   */ { ANIM_WORKING,   sizeof(ANIM_WORKING),   320 },
+    /* PHASE_THINKING  */ { ANIM_THINKING,  sizeof(ANIM_THINKING),  520 },
+    /* PHASE_LIGHTBULB */ { ANIM_LIGHTBULB, sizeof(ANIM_LIGHTBULB), 220 },
+};
+
+// Body bob (vertical) + sway (horizontal) — the sway reads as a gentle
+// arm-swing relative to the body without changing the silhouette.
+static const int8_t BOB_OFFSETS[]  = { 0, -2, -3, -2, 0, 2, 3, 2 };
+static const int8_t SWAY_OFFSETS[] = { 0, -1, -2, -2, -1, 0, 1, 2, 2, 1 };
+#define BOB_LEN  (sizeof(BOB_OFFSETS)  / sizeof(BOB_OFFSETS[0]))
+#define SWAY_LEN (sizeof(SWAY_OFFSETS) / sizeof(SWAY_OFFSETS[0]))
+#define ANIM_BASE_Y 20
+
+void ui_tick_anim(void) {
+    if (current_screen != SCREEN_SPLASH) return;
+    uint32_t now = lv_tick_get();
+
+    // Refresh the working line frequently while active so the spinner
+    // animates smoothly. Cheap — just one lv_label_set_text call.
+    static uint32_t last_render_ms = 0;
+    if (task_active_latched && now - last_render_ms >= 150) {
+        last_render_ms = now;
+        render_working_line();
+    }
+
+    const anim_phase_def_t& def = PHASE_ANIM[cur_phase];
+
+    if (now - walk_last_ms >= def.interval_ms) {
+        walk_last_ms = now;
+        static uint16_t seq_idx = 0;
+        static uint16_t bob_idx = 0;
+        static uint16_t sway_idx = 0;
+        // Wrap inside the active phase's sequence length so a phase
+        // swap doesn't index past the end of a shorter array.
+        seq_idx  = (seq_idx + 1)  % def.len;
+        bob_idx  = (bob_idx + 1)  % BOB_LEN;
+        sway_idx = (sway_idx + 1) % SWAY_LEN;
+        lv_image_set_src(anim_clawd_img, clawd_sprite_large(def.seq[seq_idx]));
+        // Lightbulb makes the figure hop a touch higher; thinking holds
+        // it still (no bob/sway) so it reads as concentrating.
+        int sway = SWAY_OFFSETS[sway_idx];
+        int bob  = BOB_OFFSETS[bob_idx];
+        if (cur_phase == PHASE_THINKING) { sway = 0; bob = 0; }
+        else if (cur_phase == PHASE_LIGHTBULB) { bob -= 2; }
+        lv_obj_align(anim_clawd_img, LV_ALIGN_TOP_MID,
+                     sway, ANIM_BASE_Y + bob);
     }
 }
 
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
-// Hide the battery indicator on the splash screen — the icon is visually
-// noisy over the pixel-art creature animations.
-static void apply_battery_visibility(void) {
-    if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-}
-
-// LVGL handles click debouncing internally. Screen-level handler fires when
-// no child consumed the event (children only consume if they have their own
-// event callback, e.g. the Reset Bluetooth zone). On BT screen we skip the
-// splash toggle so only the reset zone is interactive there.
-static void global_click_cb(lv_event_t* e) {
-    (void)e;
-    if (ui_get_current_screen() == SCREEN_BLUETOOTH) return;
-    ui_toggle_splash();
-}
-
-static void ble_reset_click_cb(lv_event_t* e) {
-    (void)e;
-    ble_clear_bonds();
-}
 
 void ui_show_screen(screen_t screen) {
-    lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
-    splash_hide();
+    lv_obj_add_flag(sub_container,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(api_container,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
 
     switch (screen) {
-    case SCREEN_SPLASH:     splash_show(); break;
-    case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_USAGE:
+        if (displayed_mode == MODE_API) lv_obj_clear_flag(api_container, LV_OBJ_FLAG_HIDDEN);
+        else                            lv_obj_clear_flag(sub_container, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case SCREEN_SPLASH:
+        lv_obj_clear_flag(anim_container, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case SCREEN_BLUETOOTH:
+        // Status screen retired in the redesign — fall through to usage.
+        if (displayed_mode == MODE_API) lv_obj_clear_flag(api_container, LV_OBJ_FLAG_HIDDEN);
+        else                            lv_obj_clear_flag(sub_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     default: break;
-    }
-
-    // Hide the logo overlay on the splash screen so the animation has a clean canvas
-    if (logo_img) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
-    apply_battery_visibility();
 }
 
 void ui_cycle_screen(void) {
-    screen_t next = (current_screen == SCREEN_USAGE) ? SCREEN_BLUETOOTH : SCREEN_USAGE;
-    ui_show_screen(next);
+    // BOOT-button: toggle between usage and animation.
+    ui_show_screen(current_screen == SCREEN_SPLASH ? SCREEN_USAGE : SCREEN_SPLASH);
 }
 
 void ui_toggle_splash(void) {
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
-    else                                  ui_show_screen(SCREEN_SPLASH);
+    else                                 ui_show_screen(SCREEN_SPLASH);
 }
 
-screen_t ui_get_current_screen(void) {
-    return current_screen;
-}
+screen_t ui_get_current_screen(void) { return current_screen; }
 
+// BLE status used to drive the (now-retired) Status screen. Keep the symbol
+// alive so main.cpp still links; ignore the parameters.
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    switch (state) {
-    case BLE_STATE_CONNECTED:
-        lv_label_set_text(lbl_ble_status, "Connected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_GREEN, 0);
-        break;
-    case BLE_STATE_ADVERTISING:
-        lv_label_set_text(lbl_ble_status, "Advertising...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_AMBER, 0);
-        break;
-    case BLE_STATE_DISCONNECTED:
-        lv_label_set_text(lbl_ble_status, "Disconnected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_RED, 0);
-        break;
-    default:
-        lv_label_set_text(lbl_ble_status, "Initializing...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-        break;
-    }
-
-    if (name) {
-        static char nbuf[48];
-        snprintf(nbuf, sizeof(nbuf), "Device: %s", name);
-        lv_label_set_text(lbl_ble_device, nbuf);
-    }
-    if (mac) {
-        static char mbuf[48];
-        snprintf(mbuf, sizeof(mbuf), "Address: %s", mac);
-        lv_label_set_text(lbl_ble_mac, mbuf);
-    }
+    (void)state; (void)name; (void)mac;
 }
 
 void ui_update_battery(int percent, bool charging) {
-    int idx;
-    if (charging) {
-        idx = 4;  // charging icon
-    } else if (percent < 0) {
-        idx = 0;  // no battery / unknown
-    } else if (percent <= 10) {
-        idx = 0;  // empty
-    } else if (percent <= 35) {
-        idx = 1;  // low
-    } else if (percent <= 75) {
-        idx = 2;  // medium
-    } else {
-        idx = 3;  // full
-    }
-    lv_image_set_src(battery_img, &battery_dscs[idx]);
-    apply_battery_visibility();
+    (void)percent; (void)charging;
 }

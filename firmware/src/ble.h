@@ -19,7 +19,3 @@ const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
-
-// BLE HID keyboard
-void ble_keyboard_press(uint8_t key, uint8_t modifier);
-void ble_keyboard_release(void);

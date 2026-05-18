@@ -1,9 +1,32 @@
 #!/usr/bin/env python3
 """Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
 
-Polls Claude API rate-limit headers and writes a JSON payload to the
-ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
-bleak (CoreBluetooth backend on macOS).
+Polls Claude usage and writes a JSON payload to the ESP32 "Claude
+Controller" peripheral over a custom GATT service. Uses bleak
+(CoreBluetooth backend on macOS).
+
+Three modes are supported, picked per-tick:
+
+* "session" (preferred) — pulls real-time data straight from the
+  Claude Code session JSONL transcripts under
+  ~/.claude/projects/*/<session>.jsonl. This is the same source
+  Claude Code's statusline reads, so the meter mirrors what you see
+  in the CLI. Updates are pushed within a few seconds of activity by
+  watching the JSONL mtime.
+
+* "api" — direct Anthropic API billing through a LiteLLM proxy. The
+  daemon reads a config file (path below) describing the LiteLLM admin
+  endpoint + key, then hits LiteLLM's user/info endpoint to get the
+  tokens spent and the token budget for the current period.
+
+* "subscription" — Claude Code subscription quotas (OAuth credentials
+  in the macOS keychain or ~/.claude/.credentials.json) — only used
+  as a fallback when no active session is detected.
+
+Resolution per tick:
+  1. Active JSONL session within SESSION_FRESH_SECONDS? → session
+  2. LiteLLM config present? → api
+  3. OAuth token present? → subscription
 """
 
 import asyncio
@@ -15,13 +38,17 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Claude Controller"
+DEVICE_NAME = "Claude Meter"
+# Bleak/CoreBluetooth has cached the old name on macOS for some users; allow
+# matching either label so the daemon connects to existing units.
+DEVICE_NAME_ALIASES = ("Claude Meter", "Claude Controller")
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
@@ -29,12 +56,34 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+# When session is active, push at least this often so the on-device
+# timer stays anchored — but the firmware advances seconds locally
+# between pushes, so we don't need 1-Hz traffic.
+ACTIVE_SYNC_INTERVAL = 15
+
+# Claude Code transcript discovery.
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# A JSONL counts as "active" if its mtime is within this many seconds.
+SESSION_FRESH_SECONDS = 30 * 60
+# Models with a [1m] suffix expose a 1M-token context window; everything
+# else is the regular 200k window.
+DEFAULT_CONTEXT_MAX = 200_000
+LARGE_CONTEXT_MAX   = 1_000_000
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+
+# Drop a JSON file at this path to switch the daemon into API-billing mode.
+# Shape:
+#   {
+#     "api_base": "https://litellm.example.com",
+#     "api_key":  "sk-...",
+#     "user_id":  "optional override; defaults to your shell username"
+#   }
+LITELLM_CONFIG_PATH = Path.home() / ".config" / "claude-usage-monitor" / "litellm.json"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -151,13 +200,29 @@ async def scan_for_device() -> str | None:
     log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
     for d in devices:
-        if d.name == DEVICE_NAME:
-            log(f"Found: {d.address}")
+        if d.name in DEVICE_NAME_ALIASES:
+            log(f"Found: {d.address} ({d.name})")
             return d.address
     return None
 
 
-async def poll_api(token: str) -> dict | None:
+def load_litellm_config() -> dict | None:
+    """Return the LiteLLM admin config dict, or None if not configured."""
+    if not LITELLM_CONFIG_PATH.exists():
+        return None
+    try:
+        cfg = json.loads(LITELLM_CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"LiteLLM config unreadable ({LITELLM_CONFIG_PATH}): {e}")
+        return None
+    if not isinstance(cfg, dict) or "api_base" not in cfg or "api_key" not in cfg:
+        log(f"LiteLLM config missing api_base/api_key: {LITELLM_CONFIG_PATH}")
+        return None
+    return cfg
+
+
+async def poll_subscription(token: str) -> dict | None:
+    """Hit Anthropic with the OAuth token; read unified 5h/7d rate-limit headers."""
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -187,14 +252,443 @@ async def poll_api(token: str) -> dict | None:
             return 0
 
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
+        "mode": "subscription",
+        "s":  pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
         "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+        "w":  pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
         "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": True,
     }
     return payload
+
+
+# Rolling token history so we can compute burn rate. (last_value, last_ts).
+_api_history: list[tuple[int, float]] = []
+
+
+def _burn_rate(tokens_now: int, now_ts: float) -> tuple[int, int]:
+    """Return (tokens_per_minute_instant, percent_change_vs_average)."""
+    _api_history.append((tokens_now, now_ts))
+    # Keep ~30 minutes of history (one poll/min → 30 entries)
+    cutoff = now_ts - 30 * 60
+    while len(_api_history) > 1 and _api_history[0][1] < cutoff:
+        _api_history.pop(0)
+    if len(_api_history) < 2:
+        return 0, 0
+    # Instantaneous: last minute or so
+    prev_tok, prev_ts = _api_history[-2]
+    dt = max(now_ts - prev_ts, 1.0)
+    instant_per_min = int(round((tokens_now - prev_tok) * 60.0 / dt))
+    # Average across the window
+    first_tok, first_ts = _api_history[0]
+    win = max(now_ts - first_ts, 60.0)
+    avg_per_min = int(round((tokens_now - first_tok) * 60.0 / win))
+    pct = 0
+    if avg_per_min > 0:
+        pct = int(round((instant_per_min - avg_per_min) * 100.0 / avg_per_min))
+    return max(instant_per_min, 0), pct
+
+
+def _next_month_mins(now: datetime) -> int:
+    """Mins until first-of-next-month at 00:00 (billing cycle boundary)."""
+    if now.month == 12:
+        nxt = datetime(now.year + 1, 1, 1)
+    else:
+        nxt = datetime(now.year, now.month + 1, 1)
+    return int((nxt - now).total_seconds() // 60)
+
+
+async def poll_api_billing(cfg: dict) -> dict | None:
+    """Hit LiteLLM admin API for tokens used + quota for the current period."""
+    base = cfg["api_base"].rstrip("/")
+    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    user_id = cfg.get("user_id") or os.environ.get("USER") or getpass.getuser()
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(f"{base}/user/info",
+                                  headers=headers,
+                                  params={"user_id": user_id})
+            resp.raise_for_status()
+            info = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log(f"LiteLLM call failed: {e}")
+        return None
+
+    record = info.get("user_info") if isinstance(info, dict) else None
+    if not isinstance(record, dict):
+        record = info if isinstance(info, dict) else {}
+
+    # Token counters — fall back to dollars/token conversion if LiteLLM
+    # only exposes spend.
+    dpt = float(cfg.get("dollars_per_token", 1e-6))
+    tokens_used  = int(record.get("total_tokens", record.get("tokens_used", 0)) or 0)
+    tokens_quota = int(record.get("token_budget", record.get("max_tokens",  0)) or 0)
+    spend_dollars  = float(record.get("spend", 0.0) or 0.0)
+    budget_dollars = float(record.get("max_budget", 0.0) or 0.0)
+    if not tokens_used and spend_dollars and dpt > 0:
+        tokens_used = int(spend_dollars / dpt)
+    if not tokens_quota and budget_dollars and dpt > 0:
+        tokens_quota = int(budget_dollars / dpt)
+
+    burn_per_min, burn_pct = _burn_rate(tokens_used, time.time())
+
+    now = datetime.now()
+    period_label = cfg.get("period_label") or now.strftime("%b %Y")
+    api_reset_mins = _next_month_mins(now)
+
+    payload: dict = {
+        "mode": "api",
+        "tu":   tokens_used,
+        "tq":   tokens_quota,
+        "ds":   int(round(spend_dollars  * 100)),
+        "db":   int(round(budget_dollars * 100)),
+        "bm":   burn_per_min,
+        "bc":   burn_pct,
+        "ar":   api_reset_mins,
+        "pl":   period_label,
+        "st":   "ok",
+        "ok":   True,
+    }
+    # Optional context-window hint for the animation screen.
+    if "context_used" in cfg:    payload["cu"] = int(cfg["context_used"])
+    if "context_max"  in cfg:    payload["cm"] = int(cfg["context_max"])
+    return payload
+
+
+def find_active_session() -> Path | None:
+    """Return the most-recently-touched JSONL transcript, if any is fresh."""
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return None
+    newest: tuple[float, Path] | None = None
+    for proj in CLAUDE_PROJECTS_DIR.iterdir():
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, f)
+    if newest is None:
+        return None
+    age = time.time() - newest[0]
+    if age > SESSION_FRESH_SECONDS:
+        return None
+    return newest[1]
+
+
+def _parse_iso_timestamp(ts: str) -> float | None:
+    if not ts:
+        return None
+    # Accept "...Z" by swapping to "+00:00" so fromisoformat accepts it.
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+
+def _settings_model() -> str | None:
+    """Read the user-selected model from ~/.claude/settings.json.
+
+    The JSONL transcript records the bare model id ("claude-opus-4-7")
+    without the variant suffix, but settings.json keeps the configured
+    alias (e.g. "opus[1m]") — which is the only place "[1m]" appears
+    locally. Read it each call so a /model swap takes effect promptly.
+    """
+    try:
+        return json.loads(CLAUDE_SETTINGS_PATH.read_text()).get("model")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+def _context_max_for(model: str | None, observed_ctx: int) -> int:
+    """Pick a context-window ceiling for the current model.
+
+    Heuristics, in order:
+      1. CLAUDE_METER_CONTEXT_MAX env var (manual override).
+      2. Either the transcript model or the configured model in
+         ~/.claude/settings.json contains "[1m]" — the 1M-context
+         variant. settings.json is the authoritative source because
+         the JSONL strips that suffix.
+      3. Observed context exceeded the standard ceiling — must be 1M.
+      4. Default to 200k.
+    """
+    override = os.environ.get("CLAUDE_METER_CONTEXT_MAX")
+    if override:
+        try:
+            n = int(override)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    settings_model = _settings_model() or ""
+    if (model and "[1m]" in model) or "[1m]" in settings_model:
+        return LARGE_CONTEXT_MAX
+    if observed_ctx > DEFAULT_CONTEXT_MAX:
+        return LARGE_CONTEXT_MAX
+    return DEFAULT_CONTEXT_MAX
+
+
+def _is_real_user_message(content: object) -> bool:
+    """True if a 'user'-type entry is human input, not a tool_result."""
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") != "tool_result":
+                return True
+    return False
+
+
+def read_session_usage(jsonl: Path) -> dict | None:
+    """Scan a JSONL transcript and summarize the current session."""
+    last_usage: dict | None = None
+    last_model: str | None = None
+    last_ts: float | None = None
+    first_ts: float | None = None
+    total_input  = 0
+    total_output = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    # "Current task" = since the most recent human user message. Tool
+    # results show up as user-type entries too, so we filter them out.
+    task_start_ts: float | None = None
+    task_output_tokens: int = 0
+    # Track the last two assistant content-block types + timestamp so we
+    # can derive a "thinking" or "lightbulb" phase for the UI.
+    prev_block_type: str | None = None
+    last_block_type: str | None = None
+    last_block_ts: float | None = None
+    try:
+        with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = obj.get("type")
+                ts = _parse_iso_timestamp(obj.get("timestamp", ""))
+                if t == "user":
+                    msg = obj.get("message")
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if _is_real_user_message(content):
+                        # New task boundary — reset the running counters.
+                        task_start_ts = ts
+                        task_output_tokens = 0
+                    continue
+                if t != "assistant":
+                    continue
+                msg = obj.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                if ts is not None:
+                    if first_ts is None or ts < first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                last_usage = usage
+                last_model = msg.get("model") or last_model
+                out_tok = int(usage.get("output_tokens", 0) or 0)
+                total_input  += int(usage.get("input_tokens", 0) or 0)
+                total_output += out_tok
+                total_cache_write += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                total_cache_read  += int(usage.get("cache_read_input_tokens", 0) or 0)
+                if task_start_ts is not None and (ts is None or ts >= task_start_ts):
+                    task_output_tokens += out_tok
+                # Capture this message's first content-block type for the
+                # phase heuristic. Claude Code writes one block per
+                # assistant message in this transcript.
+                content = msg.get("content")
+                block_type: str | None = None
+                if isinstance(content, list) and content:
+                    head = content[0]
+                    if isinstance(head, dict):
+                        block_type = head.get("type")
+                if block_type:
+                    prev_block_type = last_block_type
+                    last_block_type = block_type
+                    last_block_ts = ts
+    except OSError as e:
+        log(f"Reading session JSONL failed: {e}")
+        return None
+
+    if last_usage is None:
+        return None
+
+    ctx_used = (
+        int(last_usage.get("input_tokens", 0) or 0)
+        + int(last_usage.get("cache_creation_input_tokens", 0) or 0)
+        + int(last_usage.get("cache_read_input_tokens", 0) or 0)
+    )
+    ctx_max = _context_max_for(last_model, ctx_used)
+
+    now = time.time()
+    idle_mins = -1
+    if last_ts is not None:
+        idle_mins = max(0, int((now - last_ts) / 60))
+    age_mins = 0
+    if first_ts is not None:
+        age_mins = max(0, int((now - first_ts) / 60))
+
+    session_total = total_input + total_output + total_cache_write + total_cache_read
+    ctx_pct = 0.0
+    if ctx_max > 0:
+        ctx_pct = min(100.0, ctx_used * 100.0 / ctx_max)
+    # Cumulative tokens as a fraction of the context window — over a long
+    # session this naturally exceeds 100, which we cap so the bar pegs.
+    sess_pct = 0.0
+    if ctx_max > 0:
+        sess_pct = min(100.0, session_total * 100.0 / ctx_max)
+
+    task_seconds = 0
+    if task_start_ts is not None:
+        task_seconds = max(0, int(now - task_start_ts))
+
+    # Phase classifier. `thinking` = the latest assistant block is a
+    # thinking trace that just got written; `lightbulb` = the latest
+    # block is text/tool_use following a thinking block (idea formed);
+    # otherwise default "working".
+    phase = "working"
+    if last_block_type == "thinking" and last_block_ts and (now - last_block_ts) < 6:
+        phase = "thinking"
+    elif (prev_block_type == "thinking" and last_block_type in ("text", "tool_use")
+          and last_block_ts and (now - last_block_ts) < 4):
+        phase = "lightbulb"
+
+    return {
+        "ctx_used": ctx_used,
+        "ctx_max":  ctx_max,
+        "ctx_pct":  ctx_pct,
+        "session_total": session_total,
+        "session_pct":   sess_pct,
+        "idle_mins": idle_mins,
+        "age_mins":  age_mins,
+        "model":     last_model or "",
+        "session_id": jsonl.stem,
+        "task_tokens":  task_output_tokens,
+        "task_seconds": task_seconds,
+        "phase":        phase,
+    }
+
+
+# If the JSONL hasn't been touched in this long, Claude Code is idle.
+SESSION_ACTIVE_SECONDS = 60
+
+
+def _model_display_label(transcript_model: str, settings_model: str, ctx_max: int) -> str:
+    """Build a short, human-readable model name for the usage screen.
+
+    Combines hints from the JSONL `model` (e.g. "claude-opus-4-7") and
+    `~/.claude/settings.json` `model` (e.g. "opus[1m]") to produce a
+    label like "Opus 4.7 1M" or "Sonnet 4.6".
+    """
+    base = transcript_model or settings_model or ""
+    base = base.replace("[1m]", "").strip()
+    name = ""
+    # Family — Opus / Sonnet / Haiku, capitalized.
+    for fam in ("opus", "sonnet", "haiku"):
+        if fam in base.lower():
+            name = fam.capitalize()
+            break
+    # Version like 4-7 → "4.7" (from "claude-opus-4-7").
+    m = re.search(r"-([0-9])-([0-9])", base)
+    if m and name:
+        name += f" {m.group(1)}.{m.group(2)}"
+    # 1M tag — settings.json is authoritative since the JSONL strips it.
+    if "[1m]" in settings_model or ctx_max >= 1_000_000:
+        name += " 1M"
+    return name.strip() or "Claude"
+
+
+async def read_session_payload() -> dict | None:
+    """Pull ctx_used/ctx_max + active flag from the latest JSONL."""
+    active = find_active_session()
+    if active is None:
+        return None
+    summary = read_session_usage(active)
+    if summary is None:
+        return None
+    try:
+        mtime = active.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    is_active = (time.time() - mtime) < SESSION_ACTIVE_SECONDS
+    label = _model_display_label(
+        summary.get("model", ""), _settings_model() or "", summary["ctx_max"]
+    )
+    return {
+        "cu": summary["ctx_used"],
+        "cm": summary["ctx_max"],
+        # `act=1` tells the firmware Claude Code is mid-turn → flip to the
+        # working/animation screen. `act=0` returns to the usage screen.
+        "act": 1 if is_active else 0,
+        # Current task: output tokens since the last human user message,
+        # and seconds elapsed since that boundary.
+        "tt":  summary["task_tokens"],
+        "ts":  summary["task_seconds"],
+        # Model display label, e.g. "Opus 4.7 1M".
+        "ml":  label,
+        # Current phase — drives which working animation to play.
+        "ph":  summary["phase"],
+    }
+
+
+async def poll_usage() -> dict | None:
+    """Merge live session data with quota/billing data.
+
+    Layering:
+      * 5h / 7d / token / spend numbers come from LiteLLM (api mode)
+        or the Anthropic OAuth rate-limit headers (subscription mode).
+      * Context bar + activity flag come from the local JSONL.
+
+    The session layer is best-effort — if there's no fresh transcript,
+    we still emit the quota numbers.
+    """
+    base: dict | None = None
+    cfg = load_litellm_config()
+    if cfg is not None:
+        base = await poll_api_billing(cfg)
+    else:
+        token = read_token()
+        if token:
+            base = await poll_subscription(token)
+
+    session = await read_session_payload()
+
+    if base is None and session is None:
+        log("No quota source and no active session; skipping poll")
+        return None
+    if base is None:
+        # No API/OAuth: emit a session-only payload so the meter still
+        # shows the live context bar + working-mode flag.
+        return {
+            "mode": "subscription",
+            "s":  0.0, "sr": -1,
+            "w":  0.0, "wr": -1,
+            "st": "session",
+            "ok": True,
+            **session,
+        }
+    if session is None:
+        return base
+    # Merge: quota numbers win for the main rows, session fields win for
+    # context + activity (and replace any cu/cm the api leg may have set).
+    merged = dict(base)
+    merged.update(session)
+    return merged
 
 
 class Session:
@@ -247,22 +741,53 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     await session.setup_refresh_subscription()
 
     last_poll = 0.0
+    last_jsonl_mtime = 0.0
+    was_active: bool | None = None
+    last_phase: str | None = None
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
+            # Push whenever (a) the device asked, (b) the active JSONL
+            # changed, (c) the activity flag flipped (firmware needs to
+            # know immediately so it can swap screens), (d) Claude Code
+            # is mid-turn and the anchor interval elapsed, or (e) the
+            # idle heartbeat interval has elapsed.
             now = time.time()
-            elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            should_push = (
+                session.refresh_requested.is_set()
+                or (now - last_poll) >= POLL_INTERVAL
+            )
+            active = find_active_session()
+            session_is_active = False
+            if active is not None:
+                try:
+                    cur_mtime = active.stat().st_mtime
+                except OSError:
+                    cur_mtime = 0.0
+                if cur_mtime > last_jsonl_mtime:
+                    last_jsonl_mtime = cur_mtime
+                    should_push = True
+                if (now - cur_mtime) < SESSION_ACTIVE_SECONDS:
+                    session_is_active = True
+            # Active → idle (or idle → active) transition: push right
+            # away so the firmware flips screens within a couple seconds
+            # of the task finishing, not at the next 60s heartbeat.
+            if was_active is not None and session_is_active != was_active:
+                should_push = True
+            was_active = session_is_active
+            # Periodic anchor while active — keeps the firmware-side
+            # timer from drifting if the JSONL isn't being touched.
+            if session_is_active and (now - last_poll) >= ACTIVE_SYNC_INTERVAL:
+                should_push = True
+
+            if should_push:
                 session.refresh_requested.clear()
-                token = read_token()
-                if not token:
-                    log("No token; skipping poll")
-                else:
-                    payload = await poll_api(token)
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
+                payload = await poll_usage()
+                if payload is not None:
+                    if await session.write_payload(payload):
+                        last_poll = time.time()
+                        used_successfully = True
+                        last_phase = payload.get("ph", last_phase)
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)

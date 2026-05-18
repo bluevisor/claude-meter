@@ -2,6 +2,9 @@
 firmware/.pio/
 firmware/.vscode/
 
+# Per-device secrets (WiFi creds, future tokens). secrets.h.example is tracked.
+firmware/src/secrets.h
+
 # OS
 .DS_Store
 
